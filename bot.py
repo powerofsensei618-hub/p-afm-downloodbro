@@ -426,7 +426,14 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search))
 
     logger.info("🚀 PocketFM Bot started.")
-    app.run_polling(drop_pending_updates=True)
+    # stop_signals=None: run_polling() normally registers OS signal handlers
+    # (SIGINT/SIGTERM) via loop.add_signal_handler -> signal.set_wakeup_fd,
+    # which only works in the main thread of the main interpreter. Since
+    # this runs in a background thread (see main.py), that call raises:
+    #   ValueError: set_wakeup_fd only works in main thread of the main interpreter
+    # Skipping signal handler registration avoids the crash; Flask on the
+    # main thread still owns process-level shutdown.
+    app.run_polling(drop_pending_updates=True, stop_signals=None)
 
 
 if __name__ == "__main__":
