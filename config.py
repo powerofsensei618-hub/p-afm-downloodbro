@@ -1,31 +1,28 @@
 import os
 
-# Telegram Bot Config
+# ── Telegram ──────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
+API_ID    = int(os.environ.get("API_ID", "0"))
+API_HASH  = os.environ.get("API_HASH", "")
 
-# Flask
+# ── Flask / Render ────────────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", 8000))
 
-# PocketFM API
-PFM_BASE_URL = "https://api.pocketfm.in/v5"
-PFM_HEADERS = {
-    "User-Agent": "okhttp/3.12.1",
-    "app-version": "7.1.0",
-    "Content-Type": "application/json",
-    "app-platform": "android",
-    "locale": "en",
-}
+# ── GitHub Pages URL ─────────────────────────────────────────────────────────
+# Set this after deploying your GitHub Pages site from the repo.
+# Example: "https://yourusername.github.io/p-fm-bot"
+GITHUB_PAGES_URL = os.environ.get("GITHUB_PAGES_URL", "")   # ← fill after deploy
 
-# Bot settings
+# ── Bot display ───────────────────────────────────────────────────────────────
 RESULTS_PER_PAGE = 5
 
-# Welcome images (add your URLs here)
+# ── Welcome images (add your 5 URLs here) ────────────────────────────────────
 WELCOME_IMAGES = [
-    "https://i.imgur.com/placeholder1.jpg",  # Image 1
-    "https://i.imgur.com/placeholder2.jpg",  # Image 2
-    "https://i.imgur.com/placeholder3.jpg",  # Image 3
-    "https://i.imgur.com/placeholder4.jpg",  # Image 4
-    "https://i.imgur.com/placeholder5.jpg",  # Image 5
+    "",   # Image 1
+    "",   # Image 2
+    "",   # Image 3
+    "",   # Image 4
+    "",   # Image 5
 ]
+# Fallback banner shown when all image slots are empty
+FALLBACK_BANNER = "https://telegra.ph/file/placeholder.jpg"

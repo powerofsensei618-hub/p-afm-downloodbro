@@ -1,13 +1,18 @@
+"""
+bot.py — PocketFM Downloader Telegram Bot
+Uses PocketFM API reverse-engineered from com.radio.pocketfm APK v3.69
+"""
+
 import os
 import logging
 import random
 import asyncio
 import tempfile
+
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaPhoto,
 )
 from telegram.ext import (
     Application,
@@ -19,7 +24,13 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from config import BOT_TOKEN, WELCOME_IMAGES, RESULTS_PER_PAGE
+from config import (
+    BOT_TOKEN,
+    WELCOME_IMAGES,
+    FALLBACK_BANNER,
+    RESULTS_PER_PAGE,
+    GITHUB_PAGES_URL,
+)
 import pocketfm_api as pfm
 
 logging.basicConfig(
@@ -28,118 +39,119 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── In-memory state ────────────────────────────────────────────────────────
-# user_id → { query, results, page }
+# ── In-memory session state ───────────────────────────────────────────────────
+# uid → { query, results, page, current_show: { id, title, episodes, ep_page } }
 user_state: dict[int, dict] = {}
 
 
-# ─── /start ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# /start
+# ─────────────────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    image_url = random.choice(WELCOME_IMAGES)
+    user  = update.effective_user
+    photo = next((u for u in WELCOME_IMAGES if u), FALLBACK_BANNER)
+
+    pages_line = (
+        f"\n🌐 *Web Player:* [Open Here]({GITHUB_PAGES_URL})\n"
+        if GITHUB_PAGES_URL else ""
+    )
 
     caption = (
-        f"🎙️ *Welcome to Pocket FM Downloader, {user.first_name}!*\n\n"
-        "✨ Your one-stop destination to search and download your favourite\n"
-        "audio stories, podcasts & audiobooks from *Pocket FM* — for free.\n\n"
+        f"🎙️ *Welcome, {user.first_name}!*\n\n"
+        "✨ Search & download any audio story, podcast or audiobook\n"
+        "from *Pocket FM* — instantly, for free.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔍 *How to use me:*\n"
-        "  Just type the name of any story or show and I'll find it for you instantly.\n\n"
-        "📥 *Then tap any result* to download its episodes directly to Telegram.\n\n"
+        "🔍 *How to use:*\n"
+        "  Just type the name of any show below.\n\n"
+        "📥 *Tap a result* → pick an episode → download!\n"
+        f"{pages_line}"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💡 *Examples you can try:*\n"
+        "💡 *Try searching:*\n"
         "  • `Love Story`\n"
         "  • `Horror Night`\n"
         "  • `Motivational`\n\n"
-        "🚀 *Go ahead — type your search below!*"
+        "🚀 *Type your search below!*"
     )
 
     try:
         await update.message.reply_photo(
-            photo=image_url,
+            photo=photo,
             caption=caption,
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception:
-        # Fallback to text if image fails
         await update.message.reply_text(caption, parse_mode=ParseMode.MARKDOWN)
 
 
-# ─── Search handler ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Text search handler
+# ─────────────────────────────────────────────────────────────────────────────
 async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.message.text.strip()
     if not query:
         return
 
     uid = update.effective_user.id
-    wait_msg = await update.message.reply_text(
-        f"🔍 Searching for *{query}*…", parse_mode=ParseMode.MARKDOWN
+    wait = await update.message.reply_text(
+        f"🔍 Searching *{query}*…", parse_mode=ParseMode.MARKDOWN
     )
 
-    raw = await asyncio.get_event_loop().run_in_executor(
-        None, pfm.search_shows, query
-    )
+    loop = asyncio.get_event_loop()
+    raw     = await loop.run_in_executor(None, pfm.search_shows, query)
     results = pfm.parse_search_results(raw)
 
-    await wait_msg.delete()
+    await wait.delete()
 
     if not results:
         await update.message.reply_text(
-            f"😕 No results found for *{query}*.\n\n"
-            "Try a different keyword or check the spelling.",
+            f"😕 No results for *{query}*.\nTry a different keyword.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     user_state[uid] = {"query": query, "results": results, "page": 0}
-    await send_results_page(update, ctx, uid, edit=False)
+    await _send_results(update, ctx, uid, edit=False)
 
 
-# ─── Send paginated results ──────────────────────────────────────────────────
-async def send_results_page(
+# ─────────────────────────────────────────────────────────────────────────────
+# Paginated show results
+# ─────────────────────────────────────────────────────────────────────────────
+async def _send_results(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
     uid: int,
     edit: bool = False,
 ):
-    state = user_state.get(uid)
-    if not state:
-        return
+    s       = user_state[uid]
+    results = s["results"]
+    page    = s["page"]
+    query   = s["query"]
+    total   = len(results)
+    si      = page * RESULTS_PER_PAGE
+    ei      = min(si + RESULTS_PER_PAGE, total)
+    page_r  = results[si:ei]
+    tpages  = (total + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
 
-    results = state["results"]
-    page = state["page"]
-    query = state["query"]
-    total = len(results)
-    start_idx = page * RESULTS_PER_PAGE
-    end_idx = min(start_idx + RESULTS_PER_PAGE, total)
-    page_results = results[start_idx:end_idx]
-    total_pages = (total + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
-
-    # Build result buttons (one per row)
     buttons = []
-    for i, show in enumerate(page_results, start=start_idx + 1):
-        ep_txt = f" · {show['total_episodes']} eps" if show["total_episodes"] else ""
-        label = f"{i}. {show['title']}{ep_txt}"
-        buttons.append(
-            [InlineKeyboardButton(label, callback_data=f"show:{show['id']}")]
-        )
+    for i, show in enumerate(page_r, start=si + 1):
+        ep = f" · {show['total_episodes']} eps" if show["total_episodes"] else ""
+        lbl = f"{i}. {show['title']}{ep}"
+        buttons.append([InlineKeyboardButton(lbl[:64], callback_data=f"show:{show['id']}")])
 
-    # Navigation row
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("◀️ Previous", callback_data="page:prev"))
-    if end_idx < total:
-        nav.append(InlineKeyboardButton("Next ▶️", callback_data="page:next"))
+        nav.append(InlineKeyboardButton("◀️ Prev", callback_data="pg:prev"))
+    if ei < total:
+        nav.append(InlineKeyboardButton("Next ▶️", callback_data="pg:next"))
     if nav:
         buttons.append(nav)
 
     markup = InlineKeyboardMarkup(buttons)
     text = (
-        f"🎵 *Search results for:* `{query}`\n"
-        f"📄 Page {page + 1} of {total_pages}  |  {total} shows found\n\n"
-        "👇 *Tap a show to download its episodes:*"
+        f"🎵 Results for: `{query}`\n"
+        f"📄 Page {page+1}/{tpages} · {total} shows\n\n"
+        "👇 Tap a show:"
     )
-
     if edit and update.callback_query:
         await update.callback_query.edit_message_text(
             text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN
@@ -150,304 +162,262 @@ async def send_results_page(
         )
 
 
-# ─── Callback: pagination ────────────────────────────────────────────────────
-async def handle_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    uid = query.from_user.id
-    state = user_state.get(uid)
-    if not state:
-        await query.answer("Session expired. Please search again.", show_alert=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# Callbacks: show list pagination
+# ─────────────────────────────────────────────────────────────────────────────
+async def cb_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    s   = user_state.get(uid)
+    if not s:
+        await q.answer("Session expired — search again.", show_alert=True)
         return
-
-    direction = query.data.split(":")[1]
+    direction = q.data.split(":")[1]
     if direction == "next":
-        state["page"] += 1
-    elif direction == "prev":
-        state["page"] = max(0, state["page"] - 1)
+        s["page"] += 1
+    else:
+        s["page"] = max(0, s["page"] - 1)
+    await _send_results(update, ctx, uid, edit=True)
 
-    await send_results_page(update, ctx, uid, edit=True)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Callback: show selected → fetch episodes
+# ─────────────────────────────────────────────────────────────────────────────
+async def cb_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    show_id = q.data.split(":", 1)[1]
+    uid     = q.from_user.id
 
-# ─── Callback: show selected ─────────────────────────────────────────────────
-async def handle_show_select(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    await q.edit_message_text("⏳ Fetching episodes…")
 
-    show_id = query.data.split(":", 1)[1]
-    uid = query.from_user.id
+    loop    = asyncio.get_event_loop()
+    sh_raw  = await loop.run_in_executor(None, pfm.get_show_details, show_id)
+    ep_raw  = await loop.run_in_executor(None, pfm.get_episodes, show_id)
 
-    await query.edit_message_text(
-        "⏳ Fetching show details…", parse_mode=ParseMode.MARKDOWN
-    )
+    sh_data = sh_raw.get("data") or sh_raw.get("show") or {}
+    if isinstance(sh_data, list):
+        sh_data = sh_data[0] if sh_data else {}
+    title = sh_data.get("title") or sh_data.get("name") or "Unknown Show"
 
-    # Get show details + episodes
-    loop = asyncio.get_event_loop()
-    show_raw = await loop.run_in_executor(None, pfm.get_show_details, show_id)
-    ep_raw = await loop.run_in_executor(None, pfm.get_episodes, show_id)
-
-    show_data = (
-        show_raw.get("data", {}) or show_raw.get("show", {}) or {}
-    )
-    title = (
-        show_data.get("title")
-        or show_data.get("name")
-        or "Unknown Show"
-    )
-    description = (
-        show_data.get("description", "")
-        or show_data.get("synopsis", "")
-        or ""
-    )[:200]
-    author = show_data.get("author_name") or show_data.get("author") or ""
-
-    episodes = (
-        ep_raw.get("episodes")
-        or ep_raw.get("data", {}).get("episodes")
-        or ep_raw.get("data")
-        or []
-    )
-
-    if not isinstance(episodes, list):
-        episodes = []
+    episodes = pfm.parse_episodes(ep_raw)
 
     if not episodes:
-        await query.edit_message_text(
-            f"😕 No episodes found for *{title}*.\n\nThis show may require a login or be unavailable.",
+        await q.edit_message_text(
+            f"😕 No episodes found for *{title}*.\n"
+            "This show may require a login or be unavailable.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    # Store episodes in state
-    user_state[uid] = user_state.get(uid, {})
+    if uid not in user_state:
+        user_state[uid] = {}
     user_state[uid]["current_show"] = {
-        "id": show_id,
-        "title": title,
+        "id":       show_id,
+        "title":    title,
         "episodes": episodes,
-        "ep_page": 0,
+        "ep_page":  0,
     }
+    await _send_episodes(q, uid)
 
-    await send_episode_page(query, uid)
 
-
-# ─── Send episode list ────────────────────────────────────────────────────────
-async def send_episode_page(query, uid: int, edit: bool = True):
-    state = user_state.get(uid, {}).get("current_show")
-    if not state:
-        return
-
-    episodes = state["episodes"]
-    page = state.get("ep_page", 0)
-    title = state["title"]
-    total = len(episodes)
-    start_idx = page * RESULTS_PER_PAGE
-    end_idx = min(start_idx + RESULTS_PER_PAGE, total)
-    page_eps = episodes[start_idx:end_idx]
-    total_pages = (total + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
+# ─────────────────────────────────────────────────────────────────────────────
+# Episode list page
+# ─────────────────────────────────────────────────────────────────────────────
+async def _send_episodes(q, uid: int):
+    cs       = user_state[uid]["current_show"]
+    episodes = cs["episodes"]
+    page     = cs.get("ep_page", 0)
+    title    = cs["title"]
+    total    = len(episodes)
+    si       = page * RESULTS_PER_PAGE
+    ei       = min(si + RESULTS_PER_PAGE, total)
+    tpages   = (total + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
 
     buttons = []
-    for ep in page_eps:
-        ep_id = str(ep.get("episode_id") or ep.get("id") or "")
-        ep_title = ep.get("title") or ep.get("name") or f"Episode {ep_id}"
-        ep_num = ep.get("episode_order") or ep.get("episode_number") or ""
-        label = f"🎧 {ep_num}. {ep_title}" if ep_num else f"🎧 {ep_title}"
-        buttons.append(
-            [InlineKeyboardButton(label[:60], callback_data=f"dl:{ep_id}")]
-        )
+    for ep in episodes[si:ei]:
+        num = f"{ep['number']}. " if ep["number"] else ""
+        lbl = f"🎧 {num}{ep['title']}"
+        buttons.append([InlineKeyboardButton(lbl[:64], callback_data=f"dl:{ep['id']}")])
 
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀️ Prev", callback_data="ep:prev"))
-    if end_idx < total:
+    if ei < total:
         nav.append(InlineKeyboardButton("Next ▶️", callback_data="ep:next"))
     if nav:
         buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🔙 Back to results", callback_data="back:search")])
 
-    buttons.append(
-        [InlineKeyboardButton("🔙 Back to results", callback_data="back:search")]
-    )
-
-    markup = InlineKeyboardMarkup(buttons)
     text = (
         f"📚 *{title}*\n"
-        f"📄 Page {page + 1}/{total_pages}  |  {total} episodes\n\n"
-        "👇 *Tap an episode to download:*"
+        f"📄 Page {page+1}/{tpages} · {total} episodes\n\n"
+        "👇 Tap an episode to download:"
+    )
+    await q.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN
     )
 
-    if edit:
-        await query.edit_message_text(
-            text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN
-        )
-    else:
-        await query.message.reply_text(
-            text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN
-        )
 
-
-# ─── Callback: episode pagination ────────────────────────────────────────────
-async def handle_ep_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    uid = query.from_user.id
-    show_state = user_state.get(uid, {}).get("current_show")
-    if not show_state:
-        await query.answer("Session expired. Search again.", show_alert=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# Callbacks: episode pagination
+# ─────────────────────────────────────────────────────────────────────────────
+async def cb_ep_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q   = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    cs  = user_state.get(uid, {}).get("current_show")
+    if not cs:
+        await q.answer("Session expired.", show_alert=True)
         return
-
-    direction = query.data.split(":")[1]
+    direction = q.data.split(":")[1]
     if direction == "next":
-        show_state["ep_page"] = show_state.get("ep_page", 0) + 1
-    elif direction == "prev":
-        show_state["ep_page"] = max(0, show_state.get("ep_page", 0) - 1)
-
-    await send_episode_page(query, uid)
-
-
-# ─── Callback: back to search ─────────────────────────────────────────────────
-async def handle_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    uid = query.from_user.id
-    await send_results_page(update, ctx, uid, edit=True)
+        cs["ep_page"] = cs.get("ep_page", 0) + 1
+    else:
+        cs["ep_page"] = max(0, cs.get("ep_page", 0) - 1)
+    await _send_episodes(q, uid)
 
 
-# ─── Callback: download episode ──────────────────────────────────────────────
-async def handle_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Wait... Im Downloading ✨", show_alert=False)
+# ─────────────────────────────────────────────────────────────────────────────
+# Callback: back to search results
+# ─────────────────────────────────────────────────────────────────────────────
+async def cb_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    await _send_results(update, ctx, uid, edit=True)
 
-    episode_id = query.data.split(":", 1)[1]
-    uid = query.from_user.id
-    show_state = user_state.get(uid, {}).get("current_show", {})
-    show_title = show_state.get("title", "Pocket FM")
 
-    # Find episode title from stored list
-    ep_title = "Episode"
-    for ep in show_state.get("episodes", []):
-        eid = str(ep.get("episode_id") or ep.get("id") or "")
-        if eid == episode_id:
-            ep_title = ep.get("title") or ep.get("name") or "Episode"
-            break
+# ─────────────────────────────────────────────────────────────────────────────
+# Callback: download episode
+# ─────────────────────────────────────────────────────────────────────────────
+async def cb_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q          = update.callback_query
+    await q.answer("Wait... Im Downloading ✨", show_alert=False)
+    episode_id = q.data.split(":", 1)[1]
+    uid        = q.from_user.id
 
-    progress_msg = await query.message.reply_text(
+    cs         = user_state.get(uid, {}).get("current_show", {})
+    show_title = cs.get("title", "Pocket FM")
+    ep_title   = next(
+        (ep["title"] for ep in cs.get("episodes", []) if ep["id"] == episode_id),
+        "Episode",
+    )
+
+    prog = await q.message.reply_text(
         f"⏳ *Wait... Im Downloading* ✨\n\n"
-        f"📖 *Show:* {show_title}\n"
-        f"🎧 *Episode:* {ep_title}\n\n"
-        "_Please wait a moment…_",
+        f"📖 *{show_title}*\n"
+        f"🎧 *{ep_title}*\n\n"
+        "_Fetching audio URL…_",
         parse_mode=ParseMode.MARKDOWN,
     )
 
+    tmp_path = None
     try:
         loop = asyncio.get_event_loop()
 
-        # Get stream URL
+        # 1. Get stream URL
         stream_url = await loop.run_in_executor(
             None, pfm.get_episode_stream_url, episode_id
         )
-
         if not stream_url:
-            await progress_msg.edit_text(
+            await prog.edit_text(
                 "❌ *Download Failed*\n\n"
-                "Could not retrieve the audio URL for this episode.\n"
-                "It may require a premium account or is unavailable.",
+                "Could not get audio URL for this episode.\n"
+                "It may require a premium account.",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
 
-        # Download to temp file
+        await prog.edit_text(
+            f"📥 *Downloading audio…*\n\n"
+            f"📖 *{show_title}*\n"
+            f"🎧 *{ep_title}*",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+        # 2. Download to temp file
         with tempfile.NamedTemporaryFile(
             suffix=".mp3", prefix=f"pfm_{episode_id}_", delete=False
         ) as tmp:
             tmp_path = tmp.name
 
-        success = await loop.run_in_executor(
-            None, pfm.download_audio, stream_url, tmp_path
-        )
-
-        if not success or not os.path.exists(tmp_path):
-            await progress_msg.edit_text(
-                "❌ *Download Failed*\n\nFailed to download audio. Please try again.",
+        ok = await loop.run_in_executor(None, pfm.download_audio, stream_url, tmp_path)
+        if not ok or not os.path.exists(tmp_path):
+            await prog.edit_text(
+                "❌ *Download error.* Please try again.",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
 
-        file_size = os.path.getsize(tmp_path)
-        # Telegram limit: 50MB for bots
-        if file_size > 50 * 1024 * 1024:
-            await progress_msg.edit_text(
-                "⚠️ *File Too Large*\n\n"
-                "This episode exceeds Telegram's 50MB upload limit.\n"
-                f"File size: {file_size // (1024*1024)} MB",
+        size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
+        if size_mb > 50:
+            await prog.edit_text(
+                f"⚠️ *File too large* ({size_mb:.1f} MB)\n"
+                "Telegram bot limit is 50 MB.",
                 parse_mode=ParseMode.MARKDOWN,
             )
-            os.remove(tmp_path)
             return
 
-        await progress_msg.edit_text(
-            f"📤 *Uploading to Telegram…*\n\n"
-            f"🎧 *{ep_title}*",
+        # 3. Upload
+        await prog.edit_text(
+            f"📤 *Uploading to Telegram…*\n🎧 *{ep_title}*",
             parse_mode=ParseMode.MARKDOWN,
         )
-
+        me = await ctx.bot.get_me()
+        pages_line = f"\n🌐 [Web Player]({GITHUB_PAGES_URL})" if GITHUB_PAGES_URL else ""
         caption = (
             f"🎙️ *{show_title}*\n"
-            f"📌 *{ep_title}*\n\n"
-            f"_Downloaded via @{(await ctx.bot.get_me()).username}_"
+            f"📌 *{ep_title}*"
+            f"{pages_line}\n\n"
+            f"_Via @{me.username}_"
         )
-
-        with open(tmp_path, "rb") as audio_file:
-            await query.message.reply_audio(
-                audio=audio_file,
+        with open(tmp_path, "rb") as af:
+            await q.message.reply_audio(
+                audio=af,
                 title=ep_title,
                 performer=show_title,
                 caption=caption,
                 parse_mode=ParseMode.MARKDOWN,
             )
-
-        await progress_msg.delete()
-        os.remove(tmp_path)
+        await prog.delete()
 
     except Exception as e:
-        logger.exception(f"Download error for episode {episode_id}: {e}")
+        logger.exception(f"cb_download error ep={episode_id}: {e}")
         try:
-            await progress_msg.edit_text(
-                "❌ *Something went wrong!*\n\nPlease try again later.",
+            await prog.edit_text(
+                "❌ *Something went wrong.* Please try again.",
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
             pass
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
-# ─── Unknown messages ─────────────────────────────────────────────────────────
-async def handle_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "💬 Just type any story or show name to search!\n\n"
-        "Example: `Love Story` or `Horror Night`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-# ─── Main ────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN is not set in environment variables!")
+        raise ValueError("BOT_TOKEN env var is not set!")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_page, pattern="^page:"))
-    app.add_handler(CallbackQueryHandler(handle_show_select, pattern="^show:"))
-    app.add_handler(CallbackQueryHandler(handle_ep_page, pattern="^ep:"))
-    app.add_handler(CallbackQueryHandler(handle_download, pattern="^dl:"))
-    app.add_handler(CallbackQueryHandler(handle_back, pattern="^back:"))
+    app.add_handler(CallbackQueryHandler(cb_page,     pattern=r"^pg:"))
+    app.add_handler(CallbackQueryHandler(cb_show,     pattern=r"^show:"))
+    app.add_handler(CallbackQueryHandler(cb_ep_page,  pattern=r"^ep:"))
+    app.add_handler(CallbackQueryHandler(cb_download, pattern=r"^dl:"))
+    app.add_handler(CallbackQueryHandler(cb_back,     pattern=r"^back:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search))
 
-    logger.info("🚀 PocketFM Bot is running...")
+    logger.info("🚀 PocketFM Bot started.")
     app.run_polling(drop_pending_updates=True)
 
 

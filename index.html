@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>Pocket FM Downloader</title>
+  <style>
+    :root {
+      --bg:      #0d0d0d;
+      --card:    #161616;
+      --border:  #252525;
+      --accent:  #7c3aed;
+      --accent2: #a855f7;
+      --text:    #f1f0f5;
+      --muted:   #888;
+      --green:   #22c55e;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    header {
+      background: linear-gradient(135deg, #1a0a2e 0%, #0d0d0d 60%);
+      border-bottom: 1px solid var(--border);
+      padding: 20px 24px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .logo {
+      width: 48px; height: 48px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 14px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 24px; flex-shrink: 0;
+    }
+    header h1 { font-size: 1.3rem; font-weight: 700; }
+    header p  { font-size: 0.8rem; color: var(--muted); margin-top: 2px; }
+    .badge {
+      margin-left: auto;
+      background: #1a2a1a;
+      color: var(--green);
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 20px;
+      border: 1px solid #2a4a2a;
+    }
+
+    /* ── Hero ── */
+    .hero {
+      text-align: center;
+      padding: 60px 20px 40px;
+    }
+    .hero h2 {
+      font-size: clamp(1.6rem, 5vw, 2.4rem);
+      font-weight: 800;
+      background: linear-gradient(135deg, #fff 30%, var(--accent2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      line-height: 1.2;
+    }
+    .hero p {
+      color: var(--muted);
+      margin: 14px auto 0;
+      max-width: 500px;
+      font-size: 1rem;
+      line-height: 1.6;
+    }
+
+    /* ── CTA Button ── */
+    .cta-wrap { text-align: center; padding: 24px 20px 10px; }
+    .cta {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      color: #fff;
+      font-weight: 700;
+      font-size: 1rem;
+      padding: 14px 28px;
+      border-radius: 14px;
+      text-decoration: none;
+      box-shadow: 0 4px 24px rgba(124,58,237,0.35);
+      transition: transform .15s, box-shadow .15s;
+    }
+    .cta:hover { transform: translateY(-2px); box-shadow: 0 8px 32px rgba(124,58,237,0.5); }
+    .cta svg { width: 22px; height: 22px; fill: currentColor; }
+
+    /* ── Steps ── */
+    .steps {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      padding: 40px 20px;
+      max-width: 900px;
+      margin: 0 auto;
+      justify-content: center;
+    }
+    .step {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 22px 20px;
+      flex: 1 1 200px;
+      max-width: 260px;
+      text-align: center;
+      transition: border-color .2s;
+    }
+    .step:hover { border-color: var(--accent); }
+    .step-icon { font-size: 2rem; margin-bottom: 12px; }
+    .step h3 { font-size: 0.95rem; font-weight: 700; margin-bottom: 6px; }
+    .step p  { font-size: 0.82rem; color: var(--muted); line-height: 1.5; }
+
+    /* ── Features ── */
+    .features {
+      background: var(--card);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      padding: 40px 20px;
+    }
+    .features h2 {
+      text-align: center;
+      font-size: 1.3rem;
+      font-weight: 700;
+      margin-bottom: 24px;
+    }
+    .feat-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      max-width: 860px;
+      margin: 0 auto;
+      justify-content: center;
+    }
+    .feat {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      flex: 1 1 220px;
+      max-width: 260px;
+    }
+    .feat-dot {
+      width: 10px; height: 10px;
+      background: var(--accent2);
+      border-radius: 50%;
+      margin-top: 5px;
+      flex-shrink: 0;
+    }
+    .feat p { font-size: 0.85rem; line-height: 1.5; }
+
+    /* ── Footer ── */
+    footer {
+      margin-top: auto;
+      text-align: center;
+      padding: 24px 20px;
+      font-size: 0.78rem;
+      color: var(--muted);
+      border-top: 1px solid var(--border);
+    }
+    footer a { color: var(--accent2); text-decoration: none; }
+
+    @media (max-width: 480px) {
+      .steps, .feat-grid { flex-direction: column; align-items: center; }
+      .step, .feat { max-width: 100%; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<header>
+  <div class="logo">🎙️</div>
+  <div>
+    <h1>Pocket FM Downloader</h1>
+    <p>Telegram Bot · Audio Stories</p>
+  </div>
+  <span class="badge">● Live</span>
+</header>
+
+<!-- Hero -->
+<div class="hero">
+  <h2>Download Pocket FM Stories<br>Straight to Telegram</h2>
+  <p>Search any audio story, podcast or audiobook and download episodes
+     directly inside Telegram — fast, free, no app needed.</p>
+</div>
+
+<!-- CTA -->
+<div class="cta-wrap">
+  <!--
+    Replace the href below with your actual bot link after deploying:
+    Example: https://t.me/YourBotUsername
+  -->
+  <a class="cta" href="" target="_blank" rel="noopener">
+    <svg viewBox="0 0 24 24"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373
+      12-12S18.627 0 12 0zm5.562 8.247-1.97 9.289c-.145.658-.537.818-1.084.508l-3-2.21-1.447
+      1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12L8.32
+      13.617l-2.96-.924c-.643-.204-.657-.643.136-.953l11.57-4.461c.537-.194
+      1.006.131.836.968z"/></svg>
+    Open in Telegram
+  </a>
+</div>
+
+<!-- How it works -->
+<div class="steps">
+  <div class="step">
+    <div class="step-icon">🔍</div>
+    <h3>1. Search</h3>
+    <p>Type any story name or keyword inside the bot chat.</p>
+  </div>
+  <div class="step">
+    <div class="step-icon">📋</div>
+    <h3>2. Pick a Show</h3>
+    <p>Browse results with Previous / Next and tap the one you want.</p>
+  </div>
+  <div class="step">
+    <div class="step-icon">🎧</div>
+    <h3>3. Choose Episode</h3>
+    <p>Select any episode from the list — paginated for easy scrolling.</p>
+  </div>
+  <div class="step">
+    <div class="step-icon">📥</div>
+    <h3>4. Download</h3>
+    <p>The bot downloads & sends the audio file directly in chat.</p>
+  </div>
+</div>
+
+<!-- Features -->
+<div class="features">
+  <h2>✨ Features</h2>
+  <div class="feat-grid">
+    <div class="feat"><div class="feat-dot"></div><p><strong>Global Search</strong> — Search across all Pocket FM shows and stories.</p></div>
+    <div class="feat"><div class="feat-dot"></div><p><strong>5-per-page results</strong> — Clean pagination so you never get overwhelmed.</p></div>
+    <div class="feat"><div class="feat-dot"></div><p><strong>Direct audio files</strong> — Get MP3/AAC audio files right inside Telegram.</p></div>
+    <div class="feat"><div class="feat-dot"></div><p><strong>No login needed</strong> — Works for all freely available episodes instantly.</p></div>
+    <div class="feat"><div class="feat-dot"></div><p><strong>Always online</strong> — Deployed on Render, runs 24/7.</p></div>
+    <div class="feat"><div class="feat-dot"></div><p><strong>Progress updates</strong> — Live status messages during download &amp; upload.</p></div>
+  </div>
+</div>
+
+<!-- Footer -->
+<footer>
+  Built with ❤️ &nbsp;|&nbsp;
+  <!--
+    Replace with your actual GitHub repo URL:
+    Example: https://github.com/yourusername/p-fm-bot
+  -->
+  <a href="" target="_blank" rel="noopener">Source on GitHub</a>
+  &nbsp;|&nbsp;
+  Powered by Pocket FM API
+</footer>
+
+</body>
+</html>
