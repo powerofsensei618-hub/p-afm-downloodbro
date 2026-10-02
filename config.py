@@ -11,7 +11,7 @@ PORT = int(os.environ.get("PORT", 8000))
 # ── GitHub Pages URL ─────────────────────────────────────────────────────────
 # Set this after deploying your GitHub Pages site from the repo.
 # Example: "https://yourusername.github.io/p-fm-bot"
-GITHUB_PAGES_URL = os.environ.get("GITHUB_PAGES_URL", "")   # ← fill after deploy
+GITHUB_PAGES_URL = os.environ.get("GITHUB_PAGES_URL", "https://powerofsensei618-hub.github.io/p-fm-bot")   # ← fill after deploy
 
 # ── Bot display ───────────────────────────────────────────────────────────────
 RESULTS_PER_PAGE = 5
