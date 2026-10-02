@@ -407,6 +407,14 @@ def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN env var is not set!")
 
+    # main() runs inside a background thread (see main.py). PTB's
+    # run_polling() needs a current event loop for *this* thread, and
+    # Python no longer auto-creates one outside the main thread — without
+    # this it crashes with:
+    #   RuntimeError: There is no current event loop in thread 'Thread-x'
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
