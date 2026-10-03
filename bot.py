@@ -52,7 +52,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     photo = next((u for u in WELCOME_IMAGES if u), FALLBACK_BANNER)
 
     pages_line = (
-        f"\n🌐 *Web Player:* [Open Here]({GITHUB_PAGES_URL})\n"
+        f"\n🌐 **Made By: @SmartBoy_ApnaMS**\n"
         if GITHUB_PAGES_URL else ""
     )
 
