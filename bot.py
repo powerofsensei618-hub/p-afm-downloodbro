@@ -51,10 +51,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user  = update.effective_user
     photo = next((u for u in WELCOME_IMAGES if u), FALLBACK_BANNER)
 
-    pages_line = (
-        f"\n🌐 **Made By: @SmartBoy_ApnaMS**\n"
-        if GITHUB_PAGES_URL else ""
-    )
 
     caption = (
         f"🎙️ *Welcome, {user.first_name}!*\n\n"
@@ -64,13 +60,13 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔍 *How to use:*\n"
         "  Just type the name of any show below.\n\n"
         "📥 *Tap a result* → pick an episode → download!\n"
-        f"{pages_line}"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "💡 *Try searching:*\n"
         "  • `Love Story`\n"
         "  • `Horror Night`\n"
         "  • `Motivational`\n\n"
-        "🚀 *Type your search below!*"
+        "🚀 *Type your search below!\n\n*"
+        "🌐*Made By: @SmartBoy_ApnaMS*"
     )
 
     try:
