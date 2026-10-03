@@ -193,13 +193,11 @@ async def cb_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("⏳ Fetching episodes…")
 
     loop    = asyncio.get_event_loop()
-    sh_raw  = await loop.run_in_executor(None, pfm.get_show_details, show_id)
     ep_raw  = await loop.run_in_executor(None, pfm.get_episodes, show_id)
 
-    sh_data = sh_raw.get("data") or sh_raw.get("show") or {}
-    if isinstance(sh_data, list):
-        sh_data = sh_data[0] if sh_data else {}
-    title = sh_data.get("title") or sh_data.get("name") or "Unknown Show"
+    # pocketfm.com has no standalone show-details endpoint — the title is
+    # bundled into the episode-list response itself.
+    title = ep_raw.get("show_title") or "Unknown Show"
 
     episodes = pfm.parse_episodes(ep_raw)
 
@@ -317,15 +315,21 @@ async def cb_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         loop = asyncio.get_event_loop()
 
-        # 1. Get stream URL
-        stream_url = await loop.run_in_executor(
-            None, pfm.get_episode_stream_url, episode_id
+        # 1. Stream URL is already embedded in the episode data fetched when
+        #    the show's episode list was loaded (pocketfm.com returns it
+        #    directly on each story — no separate "get stream" endpoint).
+        ep_data = next(
+            (ep for ep in cs.get("episodes", []) if ep["id"] == episode_id), None
         )
+        stream_url = (ep_data or {}).get("media_url") or (ep_data or {}).get("hls_url")
         if not stream_url:
+            reason = (
+                "🔒 This episode is locked/paid on PocketFM — no free audio URL available."
+                if (ep_data or {}).get("is_locked")
+                else "Could not get audio URL for this episode.\nIt may require a premium account."
+            )
             await prog.edit_text(
-                "❌ *Download Failed*\n\n"
-                "Could not get audio URL for this episode.\n"
-                "It may require a premium account.",
+                f"❌ *Download Failed*\n\n{reason}",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return

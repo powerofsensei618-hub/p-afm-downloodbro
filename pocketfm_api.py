@@ -1,73 +1,134 @@
 """
 pocketfm_api.py
 ───────────────
-PocketFM API client reverse-engineered from com.radio.pocketfm APK v3.69
-(package: com.radio.pocketfm, host: www.pocketfm.in / api.pocketfm.in)
+PocketFM API client — talks to the **real** internal API that pocketfm.com's
+own website (Next.js, App Router) uses for search and episode listing.
 
-Endpoints discovered from:
- - AndroidManifest.xml  →  host: www.pocketfm.in
- - APK version info     →  versionName: 3.69 / versionCode: 202
- - OkHttp interceptor patterns in decompiled c/* classes
- - Publicly observed traffic from the app
+This replaces the earlier version of this file, which guessed at a mobile-app
+REST API (api.pocketfm.in /v4 /v5) that turned out to not exist (confirmed
+404 on every guessed route). The endpoints below were captured directly from
+pocketfm.com's own network traffic and are confirmed working.
+
+How it works
+────────────
+pocketfm.com is a Next.js app. Instead of a normal REST API, search and the
+show/episode list are implemented as **Next.js Server Actions**: the browser
+POSTs to the page URL itself (e.g. "/" for search, "/show/<id>" for episode
+list) with special headers:
+    - Accept: text/x-component
+    - next-action: <per-build action hash>
+    - next-router-state-tree: <url-encoded JSON describing the current route>
+and a JSON array body of the action's arguments.
+
+The response is a React Server Components "Flight" stream: newline-separated
+chunks shaped like "<index>:<json-or-reference>". The chunk holding the
+actual payload is referenced from chunk "0" (e.g. "a":"$@1" → chunk "1" has
+the data). `_parse_rsc_stream()` below decodes that.
+
+Caveat: `next-action` hashes are generated per deployment build of
+pocketfm.com. If pocketfm.com redeploys, these hashes can change and this
+file will need the same network-capture process repeated (browser dev tools
+→ Network tab → trigger a search / open a show → copy the new `next-action`
+value and request body shape).
 """
 
-import requests
+import json
 import logging
+import re
 import time
 from typing import Optional
+from urllib.parse import quote
+
+import requests
 
 logger = logging.getLogger(__name__)
 
-# ── Base URLs (from APK manifest + observed traffic) ─────────────────────────
-_BASE_V5   = "https://api.pocketfm.in/v5"
-_BASE_V4   = "https://api.pocketfm.in/v4"
-_BASE_WEB  = "https://pocketfm.in/api"
+# ── Base URL ───────────────────────────────────────────────────────────────
+_BASE_WEB = "https://pocketfm.com"
 
-# ── Headers mimicking APK v3.69 OkHttp calls ─────────────────────────────────
-# These values are extracted from the decompiled OkHttp interceptor classes
-# (c/d.java, c/e.java) in the APK — the app sets these on every request.
+# ── Captured Next.js Server Action hashes (pocketfm.com build) ──────────────
+# Search box on the homepage → POST https://pocketfm.com/
+_ACTION_SEARCH = "408978df9ec2be478467a61e5211d591d404284654"
+# "Load more episodes" on a show page → POST https://pocketfm.com/show/<id>
+_ACTION_EPISODES = "40fcf5bff259b98f5b39b1cba3bff405dc326aa82f"
+
+# ── Headers mimicking a real desktop browser hitting pocketfm.com ───────────
 _HEADERS = {
-    "User-Agent":       "PocketFM/3.69 (Linux; Android 10; Build/QKQ1) okhttp/3.12.1",
-    "app-version":      "3.69",
-    "app-version-code": "202",
-    "app-platform":     "android",
-    "Content-Type":     "application/json",
-    "Accept":           "application/json",
-    "locale":           "en",
-    "country-code":     "IN",
-    "timezone":         "Asia/Kolkata",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/x-component",
+    "Content-Type": "text/plain;charset=UTF-8",
+    "Origin": "https://pocketfm.com",
 }
 
-# ── Session (keep-alive, connection pooling) ──────────────────────────────────
 _session = requests.Session()
 _session.headers.update(_HEADERS)
 
 
-def _get(url: str, params: dict = None, timeout: int = 15) -> dict:
-    """Safe GET with retry."""
-    for attempt in range(3):
-        try:
-            r = _session.get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.HTTPError as e:
-            logger.warning(f"GET {url} → HTTP {e.response.status_code} (attempt {attempt+1})")
-            if e.response.status_code in (401, 403, 404):
-                break
-        except Exception as e:
-            logger.warning(f"GET {url} error (attempt {attempt+1}): {e}")
-        if attempt < 2:
-            time.sleep(1.5 * (attempt + 1))
-    return {}
+# ─────────────────────────────────────────────────────────────────────────────
+# Next.js router-state-tree builders
+# ─────────────────────────────────────────────────────────────────────────────
+def _encode_tree(tree) -> str:
+    """JSON-encode + URL-encode exactly like the browser's encodeURIComponent
+    (which, unlike Python's default quote(), leaves !~*'() unescaped)."""
+    return quote(json.dumps(tree, separators=(",", ":")), safe="!~*'()")
 
 
-def _post(url: str, payload: dict = None, timeout: int = 15) -> dict:
-    """Safe POST with retry."""
+def _router_tree_home() -> str:
+    tree = ["", {"children": ["(home)", {"children": ["__PAGE__", {}, None, None, 4096]},
+                               None, None, 4096]}, None, None, 4112]
+    return _encode_tree(tree)
+
+
+def _router_tree_show(show_id: str) -> str:
+    tree = ["", {"children": ["(show-episode)", {"children": ["show", {"children": [
+        ["slug", show_id, "c", None],
+        {"children": ["__PAGE__", {}, None, None, 4096]}, None, None, 4096
+    ]}, None, None, 4096]}, None, None, 4096]}, None, None, 4112]
+    return _encode_tree(tree)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RSC ("Flight") stream parsing
+# ─────────────────────────────────────────────────────────────────────────────
+_CHUNK_RE = re.compile(r"^([0-9a-fA-F]+):(.*)$")
+
+
+def _parse_rsc_stream(text: str) -> dict:
+    """Parse a Next.js Flight response into {chunk_index: parsed_json}."""
+    chunks = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _CHUNK_RE.match(line)
+        if not m:
+            continue
+        idx, payload = m.group(1), m.group(2)
+        try:
+            chunks[idx] = json.loads(payload)
+        except (json.JSONDecodeError, ValueError):
+            chunks[idx] = payload
+    return chunks
+
+
+def _rsc_post(path: str, action: str, router_state_tree: str, payload: list, referer: str) -> dict:
+    """POST a Next.js Server Action call and return its parsed Flight chunks."""
+    url = f"{_BASE_WEB}{path}"
+    headers = {
+        "next-action": action,
+        "next-router-state-tree": router_state_tree,
+        "Referer": referer,
+    }
+    body = json.dumps(payload, separators=(",", ":"))
+
     for attempt in range(3):
         try:
-            r = _session.post(url, json=payload or {}, timeout=timeout)
+            r = _session.post(url, headers=headers, data=body, timeout=15)
             r.raise_for_status()
-            return r.json()
+            return _parse_rsc_stream(r.text)
         except requests.exceptions.HTTPError as e:
             logger.warning(f"POST {url} → HTTP {e.response.status_code} (attempt {attempt+1})")
             if e.response.status_code in (401, 403, 404):
@@ -82,28 +143,21 @@ def _post(url: str, payload: dict = None, timeout: int = 15) -> dict:
 # ────────────────────────────────────────────────────────────────────────────
 # SEARCH
 # ────────────────────────────────────────────────────────────────────────────
-def search_shows(query: str, page_token: str = None) -> dict:
+def search_shows(query: str) -> list:
     """
-    Search PocketFM shows.
-    APK uses POST /v5/show_v2/search with JSON body.
-    Fallback: GET /v5/show/search?q=...
+    Search PocketFM shows via pocketfm.com's homepage search action.
+    Returns the raw list of entity dicts (as sent by pocketfm.com) —
+    pass to parse_search_results() to normalize.
     """
-    # Primary — v5 POST (from APK network interceptor pattern)
-    payload = {"search_text": query}
-    if page_token:
-        payload["page_token"] = page_token
-
-    data = _post(f"{_BASE_V5}/show_v2/search", payload)
-    if data:
-        return data
-
-    # Fallback — v4 GET
-    data = _get(f"{_BASE_V4}/show/search", {"q": query, "page": 1})
-    if data:
-        return data
-
-    # Fallback — web API
-    return _get(f"{_BASE_WEB}/shows/search", {"query": query})
+    chunks = _rsc_post(
+        "/",
+        _ACTION_SEARCH,
+        _router_tree_home(),
+        [{"queryString": query}],
+        referer=f"{_BASE_WEB}/",
+    )
+    data = chunks.get("1")
+    return data if isinstance(data, list) else []
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -111,110 +165,34 @@ def search_shows(query: str, page_token: str = None) -> dict:
 # ────────────────────────────────────────────────────────────────────────────
 def get_show_details(show_id: str) -> dict:
     """
-    Get full show metadata.
-    APK: GET /v5/show_v2/get?show_id=<id>
+    No standalone "show details" endpoint has been captured yet — pocketfm.com
+    bundles the show title into the episode-list response instead (see
+    get_episodes()'s "show_title" field). Kept as a safe no-op so any caller
+    expecting a dict doesn't crash; callers should prefer the show_title from
+    get_episodes().
     """
-    data = _get(f"{_BASE_V5}/show_v2/get", {"show_id": show_id})
-    if data:
-        return data
-    return _get(f"{_BASE_V4}/show/get", {"show_id": show_id})
+    return {}
 
 
 # ────────────────────────────────────────────────────────────────────────────
 # EPISODE LIST
 # ────────────────────────────────────────────────────────────────────────────
-def get_episodes(show_id: str, page_token: str = None) -> dict:
+def get_episodes(show_id: str, curr_ptr: int = 0, page_size: int = 50) -> dict:
     """
-    Get episode list for a show.
-    APK: GET /v5/episode_v2/list?show_id=<id>&page_token=<token>
+    Fetch the episode list for a show via pocketfm.com's show-page action.
+    Returns the raw "result" dict (show_title, episodes_count, stories, ...).
     """
-    params = {"show_id": show_id}
-    if page_token:
-        params["page_token"] = page_token
-
-    data = _get(f"{_BASE_V5}/episode_v2/list", params)
-    if data:
-        return data
-    return _get(f"{_BASE_V4}/episode/list", {"show_id": show_id})
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# EPISODE STREAM URL
-# ────────────────────────────────────────────────────────────────────────────
-def get_episode_stream_url(episode_id: str) -> Optional[str]:
-    """
-    Resolve the direct audio stream URL for an episode.
-
-    PocketFM serves audio as AAC/MP3 via CDN.
-    APK fetches: GET /v5/episode_v2/get?episode_id=<id>
-    The audio URL is nested in different fields depending on API version.
-    """
-    # Try v5 first
-    data = _get(f"{_BASE_V5}/episode_v2/get", {"episode_id": episode_id})
-    url = _extract_audio_url(data, episode_id)
-    if url:
-        return url
-
-    # Try v4
-    data = _get(f"{_BASE_V4}/episode/get", {"episode_id": episode_id})
-    url = _extract_audio_url(data, episode_id)
-    if url:
-        return url
-
-    # Try media-specific endpoint
-    data = _get(f"{_BASE_V5}/episode_v2/stream", {"episode_id": episode_id})
-    return _extract_audio_url(data, episode_id)
-
-
-def _extract_audio_url(data: dict, episode_id: str) -> Optional[str]:
-    """
-    Walk the response tree to find the audio URL.
-    PocketFM API response structure varies across versions:
-
-    v5: { "data": { "stream_url": "...", "media_details": { "audio_url": "..." } } }
-    v4: { "episode": { "url": "...", "cdn_url": "..." } }
-    """
-    if not data:
-        return None
-
-    # Unwrap common envelope keys
-    inner = (
-        data.get("data")
-        or data.get("episode")
-        or data.get("result")
-        or data
+    chunks = _rsc_post(
+        f"/show/{show_id}",
+        _ACTION_EPISODES,
+        _router_tree_show(show_id),
+        [{"showId": show_id, "campaignName": "", "currPtr": curr_ptr, "pageSize": page_size}],
+        referer=f"{_BASE_WEB}/show/{show_id}",
     )
-    if not isinstance(inner, dict):
-        return None
-
-    # Direct URL fields (priority order from APK analysis)
-    for key in ("stream_url", "audio_url", "url", "cdn_url", "media_url",
-                "secure_url", "file_url", "download_url"):
-        val = inner.get(key)
-        if val and isinstance(val, str) and val.startswith("http"):
-            logger.info(f"Audio URL found via key '{key}' for episode {episode_id}")
-            return val
-
-    # Nested inside media_details
-    media = inner.get("media_details") or inner.get("media") or {}
-    if isinstance(media, dict):
-        for key in ("stream_url", "audio_url", "url", "cdn_url"):
-            val = media.get(key)
-            if val and isinstance(val, str) and val.startswith("http"):
-                logger.info(f"Audio URL found via media_details.{key} for episode {episode_id}")
-                return val
-
-    # Nested inside attachments list
-    attachments = inner.get("attachments") or []
-    for att in attachments:
-        if isinstance(att, dict):
-            for key in ("url", "stream_url", "audio_url"):
-                val = att.get(key)
-                if val and isinstance(val, str) and val.startswith("http"):
-                    return val
-
-    logger.warning(f"No audio URL in response for episode {episode_id}. Keys: {list(inner.keys())}")
-    return None
+    data = chunks.get("1")
+    if isinstance(data, dict):
+        return data.get("result") or {}
+    return {}
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -223,13 +201,17 @@ def _extract_audio_url(data: dict, episode_id: str) -> Optional[str]:
 def download_audio(stream_url: str, dest_path: str) -> bool:
     """
     Stream-download audio from CDN to dest_path.
-    Uses Range header (as seen in APK's DownloadReceiver) for resume support.
+    Works for direct audio file URLs (mp3/aac). NOTE: if an episode's only
+    available URL is an HLS playlist (.m3u8), this will save the raw
+    playlist text, not a playable audio file — PocketFM's web app embeds
+    direct media_url for free episodes, so this path is for that case.
     """
     try:
-        dl_headers = dict(_HEADERS)
-        dl_headers["Range"] = "bytes=0-"
-        dl_headers["Accept"] = "*/*"
-
+        dl_headers = {
+            "User-Agent": _HEADERS["User-Agent"],
+            "Accept": "*/*",
+            "Range": "bytes=0-",
+        }
         with requests.get(
             stream_url,
             headers=dl_headers,
@@ -251,101 +233,82 @@ def download_audio(stream_url: str, dest_path: str) -> bool:
 # ────────────────────────────────────────────────────────────────────────────
 # PARSE HELPERS
 # ────────────────────────────────────────────────────────────────────────────
-def parse_search_results(raw: dict) -> list[dict]:
+def parse_search_results(raw: list) -> list[dict]:
     """
-    Normalize search results from any API version into a flat list:
+    Normalize pocketfm.com search results into a flat list:
     [{ id, title, subtitle, image_url, total_episodes }]
-    """
-    items = (
-        raw.get("shows")
-        or raw.get("data", {}).get("shows") if isinstance(raw.get("data"), dict) else None
-        or (raw.get("data") if isinstance(raw.get("data"), list) else None)
-        or raw.get("results")
-        or raw.get("result")
-        or []
-    )
-    if not isinstance(items, list):
-        items = []
 
+    Real shape (captured from pocketfm.com):
+    {"entity_id": "...", "entity_type": "show", "title": "...", "plays": "...",
+     "avg_rating": 4.7, "image_url": "...", "creator_name": "...",
+     "genre_searchable": [...], "slugify_path": "..."}
+    """
+    items = raw if isinstance(raw, list) else []
     results = []
     for item in items:
-        show_id = (
-            item.get("show_id")
-            or item.get("id")
-            or item.get("show_slug")
-            or ""
-        )
-        title = (
-            item.get("title")
-            or item.get("name")
-            or item.get("show_title")
-            or "Unknown Title"
-        )
-        subtitle = (
-            item.get("author_name")
-            or item.get("author")
-            or item.get("sub_title")
-            or (item.get("description", "") or "")[:60]
-        )
-        image = (
-            item.get("thumbnail_url")
-            or item.get("image_url")
-            or item.get("cover_image")
-            or item.get("thumbnail")
-            or ""
-        )
-        total_ep = (
-            item.get("total_episodes")
-            or item.get("episode_count")
-            or item.get("episodes_count")
-            or 0
-        )
-        if show_id:
-            results.append({
-                "id":             str(show_id),
-                "title":          title,
-                "subtitle":       subtitle,
-                "image_url":      image,
-                "total_episodes": int(total_ep) if str(total_ep).isdigit() else 0,
-            })
+        if not isinstance(item, dict):
+            continue
+        if item.get("entity_type") and item.get("entity_type") != "show":
+            continue
+
+        show_id = item.get("entity_id") or item.get("show_id") or item.get("id") or ""
+        if not show_id:
+            continue
+
+        title = item.get("title") or item.get("show_title") or "Unknown Title"
+
+        genres = item.get("genre_searchable") or []
+        subtitle = item.get("creator_name") or (", ".join(genres) if genres else "")
+
+        image = item.get("image_url") or item.get("thumbnail_url") or ""
+
+        results.append({
+            "id":             str(show_id),
+            "title":          title,
+            "subtitle":       subtitle,
+            "image_url":      image,
+            # Episode count isn't included in search results on pocketfm.com —
+            # it's only known once the show is opened (get_episodes()).
+            "total_episodes": 0,
+        })
     return results
 
 
 def parse_episodes(raw: dict) -> list[dict]:
     """
-    Normalize episode list from any API version:
-    [{ id, title, number, duration }]
+    Normalize pocketfm.com's episode list ("stories") into a flat list:
+    [{ id, title, number, duration, media_url, hls_url, is_locked }]
+
+    Real shape (captured from pocketfm.com, per story):
+    {"story_id": "...", "story_title": "...", "seq_number": 21,
+     "story_duration": 800, "media_url": "", "hls_url": "", "is_locked": true,
+     "coins_required": 11, ...}
     """
-    items = (
-        raw.get("episodes")
-        or (raw.get("data", {}).get("episodes") if isinstance(raw.get("data"), dict) else None)
-        or (raw.get("data") if isinstance(raw.get("data"), list) else None)
-        or []
-    )
+    items = raw.get("stories") if isinstance(raw, dict) else None
     if not isinstance(items, list):
         items = []
 
     results = []
     for ep in items:
-        ep_id = str(ep.get("episode_id") or ep.get("id") or "")
-        ep_title = (
-            ep.get("title")
-            or ep.get("name")
-            or ep.get("episode_title")
-            or f"Episode {ep_id}"
-        )
-        ep_num = (
-            ep.get("episode_order")
-            or ep.get("episode_number")
-            or ep.get("order")
-            or ""
-        )
-        duration = ep.get("duration") or ep.get("length") or 0
-        if ep_id:
-            results.append({
-                "id":       ep_id,
-                "title":    ep_title,
-                "number":   ep_num,
-                "duration": duration,
-            })
+        if not isinstance(ep, dict):
+            continue
+        ep_id = str(ep.get("story_id") or ep.get("episode_id") or ep.get("id") or "")
+        if not ep_id:
+            continue
+
+        title = ep.get("story_title") or ep.get("title") or f"Episode {ep_id}"
+        number = ep.get("seq_number") or ep.get("natural_sequence_number") or ""
+        duration = ep.get("story_duration") or ep.get("duration") or 0
+
+        results.append({
+            "id":         ep_id,
+            "title":      title,
+            "number":     number,
+            "duration":   duration,
+            # Free episodes carry a direct URL here; paid/locked ones are
+            # blank until unlocked — see cb_download in bot.py.
+            "media_url":  ep.get("media_url") or "",
+            "hls_url":    ep.get("hls_url") or "",
+            "is_locked":  bool(ep.get("is_locked")),
+        })
     return results
