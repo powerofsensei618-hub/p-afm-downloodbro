@@ -169,13 +169,13 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔍 *How to use:*\n"
         "  Just type the name of any show below.\n\n"
         "📥 *Tap a result* → pick an episode → download!\n"
-        f"{pages_line}"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "💡 *Try searching:*\n"
         "  • `Love Story`\n"
         "  • `Horror Night`\n"
         "  • `Motivational`\n\n"
-        "🚀 *Type your search below!*"
+        "🚀 *Type your search below!*\n\n"
+        "✨*Bot Made By: @SmartBoy_ApnaMS*"
     )
 
     try:
