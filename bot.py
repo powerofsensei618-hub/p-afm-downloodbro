@@ -66,7 +66,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  • `Horror Night`\n"
         "  • `Motivational`\n\n"
         "🚀 *Type your search below!\n\n*"
-        "🌐*Made By: @SmartBoy_ApnaMS*"
+        "🌐*Made By: @SmartBoy_ApnaMS*\n"
+        "*━━━━━━━━━━━━━━━━━━━━━━*"
     )
 
     try:
