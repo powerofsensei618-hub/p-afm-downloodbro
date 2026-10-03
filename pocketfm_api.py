@@ -34,7 +34,9 @@ value and request body shape).
 
 import json
 import logging
+import os
 import re
+import subprocess
 import time
 from typing import Optional
 from urllib.parse import quote
@@ -198,36 +200,113 @@ def get_episodes(show_id: str, curr_ptr: int = 0, page_size: int = 50) -> dict:
 # ────────────────────────────────────────────────────────────────────────────
 # DOWNLOAD
 # ────────────────────────────────────────────────────────────────────────────
+def _download_direct(stream_url: str, dest_path: str) -> bool:
+    """Plain streamed HTTP download — for direct audio file URLs (mp3/aac)."""
+    dl_headers = {
+        "User-Agent": _HEADERS["User-Agent"],
+        "Accept": "*/*",
+        "Range": "bytes=0-",
+    }
+    with requests.get(
+        stream_url, headers=dl_headers, stream=True, timeout=120, allow_redirects=True
+    ) as r:
+        r.raise_for_status()
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+    return True
+
+
+def _download_hls(stream_url: str, dest_path: str) -> bool:
+    """
+    Download and remux an HLS (.m3u8) stream into a single playable audio
+    file via ffmpeg. A plain HTTP GET on an .m3u8 URL only saves the
+    playlist text, not the actual audio — this is why episodes were
+    "downloading" a few hundred bytes of garbage before.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-user_agent", _HEADERS["User-Agent"],
+        "-i", stream_url,
+        "-vn",                 # drop video track — this is an audio download
+        "-acodec", "libmp3lame",
+        "-q:a", "2",
+        "-loglevel", "error",
+        dest_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=300)
+    if proc.returncode != 0:
+        logger.error(f"ffmpeg failed [{stream_url[:60]}]: {proc.stderr.decode(errors='ignore')[:500]}")
+        return False
+    return True
+
+
 def download_audio(stream_url: str, dest_path: str) -> bool:
     """
-    Stream-download audio from CDN to dest_path.
-    Works for direct audio file URLs (mp3/aac). NOTE: if an episode's only
-    available URL is an HLS playlist (.m3u8), this will save the raw
-    playlist text, not a playable audio file — PocketFM's web app embeds
-    direct media_url for free episodes, so this path is for that case.
+    Download audio from CDN to dest_path (always ends up a playable file at
+    dest_path regardless of source format). Picks the right method:
+      - .m3u8 (HLS adaptive stream) → ffmpeg download + remux to mp3
+      - anything else (direct mp3/aac file)  → plain streamed HTTP GET
     """
     try:
-        dl_headers = {
-            "User-Agent": _HEADERS["User-Agent"],
-            "Accept": "*/*",
-            "Range": "bytes=0-",
-        }
-        with requests.get(
-            stream_url,
-            headers=dl_headers,
-            stream=True,
-            timeout=120,
-            allow_redirects=True,
-        ) as r:
-            r.raise_for_status()
-            with open(dest_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
-        return True
+        is_hls = ".m3u8" in stream_url.lower()
+        ok = _download_hls(stream_url, dest_path) if is_hls else _download_direct(stream_url, dest_path)
+        return ok and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
     except Exception as e:
         logger.error(f"download_audio failed [{stream_url[:60]}]: {e}")
         return False
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# LANGUAGE DETECTION
+# ────────────────────────────────────────────────────────────────────────────
+# PocketFM's search API doesn't return an explicit language field — only the
+# show title does, either via an explicit "(Language)" suffix (used mainly
+# for alt-language versions of a show, e.g. "My Vampire System (English)")
+# or implicitly via the script the title is written in. This is a best-effort
+# heuristic, not a guarantee — titles with no non-Latin script and no
+# explicit tag default to "hindi" since that's PocketFM's primary catalog.
+_LANG_TAG_RE = re.compile(r"\(([a-zA-Z]+)\)\s*$")
+
+_LANG_TAG_MAP = {
+    "hindi": "hindi", "english": "english", "tamil": "tamil",
+    "telugu": "telugu", "bengali": "bengali", "marathi": "marathi",
+    "gujarati": "gujarati", "punjabi": "punjabi", "malayalam": "malayalam",
+    "kannada": "kannada",
+}
+
+# (unicode block start, end, language code)
+_SCRIPT_RANGES = [
+    (0x0900, 0x097F, "hindi"),      # Devanagari
+    (0x0B80, 0x0BFF, "tamil"),      # Tamil
+    (0x0C00, 0x0C7F, "telugu"),     # Telugu
+    (0x0980, 0x09FF, "bengali"),    # Bengali
+    (0x0A80, 0x0AFF, "gujarati"),   # Gujarati
+    (0x0A00, 0x0A7F, "punjabi"),    # Gurmukhi
+    (0x0D00, 0x0D7F, "malayalam"),  # Malayalam
+    (0x0C80, 0x0CFF, "kannada"),    # Kannada
+]
+
+
+def detect_language(title: str) -> str:
+    """Best-effort language code for a show, from its title. See notes above."""
+    if not title:
+        return "hindi"
+
+    m = _LANG_TAG_RE.search(title.strip())
+    if m:
+        tag = m.group(1).lower()
+        if tag in _LANG_TAG_MAP:
+            return _LANG_TAG_MAP[tag]
+
+    for ch in title:
+        cp = ord(ch)
+        for lo, hi, lang in _SCRIPT_RANGES:
+            if lo <= cp <= hi:
+                return lang
+
+    return "hindi"
 
 
 # ────────────────────────────────────────────────────────────────────────────

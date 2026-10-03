@@ -13,6 +13,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
 )
 from telegram.ext import (
     Application,
@@ -32,6 +33,7 @@ from config import (
     GITHUB_PAGES_URL,
 )
 import pocketfm_api as pfm
+import lang_store
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -40,8 +42,101 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── In-memory session state ───────────────────────────────────────────────────
-# uid → { query, results, page, current_show: { id, title, episodes, ep_page } }
+# uid → { query, results, page, list_is_photo,
+#         current_show: { id, title, image_url, episodes, ep_page, is_photo } }
 user_state: dict[int, dict] = {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Photo-card helpers — send/edit a message as a photo with caption + buttons,
+# falling back to a plain text message if the image can't be fetched/sent.
+# Each caller tracks the returned is_photo flag so pagination knows whether
+# to edit via edit_message_media (photo) or edit_message_text (text).
+# ─────────────────────────────────────────────────────────────────────────────
+async def _reply_card(target_message, photo_url, caption, markup):
+    if photo_url:
+        try:
+            msg = await target_message.reply_photo(
+                photo=photo_url, caption=caption, reply_markup=markup,
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return msg, True
+        except Exception as e:
+            logger.warning(f"reply_photo failed, falling back to text: {e}")
+    msg = await target_message.reply_text(
+        caption, reply_markup=markup, parse_mode=ParseMode.MARKDOWN
+    )
+    return msg, False
+
+
+async def _edit_card(q, photo_url, caption, markup, is_photo):
+    """Returns the (possibly changed) is_photo state of the message."""
+    if is_photo:
+        try:
+            if photo_url:
+                await q.edit_message_media(
+                    media=InputMediaPhoto(
+                        media=photo_url, caption=caption, parse_mode=ParseMode.MARKDOWN
+                    ),
+                    reply_markup=markup,
+                )
+            else:
+                await q.edit_message_caption(
+                    caption=caption, reply_markup=markup, parse_mode=ParseMode.MARKDOWN
+                )
+            return True
+        except Exception as e:
+            logger.warning(f"edit photo card failed: {e}")
+            return is_photo
+    else:
+        try:
+            await q.edit_message_text(
+                caption, reply_markup=markup, parse_mode=ParseMode.MARKDOWN
+            )
+            return False
+        except Exception as e:
+            logger.warning(f"edit text card failed: {e}")
+            return is_photo
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /lang — language picker
+# ─────────────────────────────────────────────────────────────────────────────
+def _lang_keyboard() -> InlineKeyboardMarkup:
+    codes = list(lang_store.LANGUAGES.items())
+    rows = [
+        [
+            InlineKeyboardButton(codes[i][1], callback_data=f"lang:{codes[i][0]}"),
+            InlineKeyboardButton(codes[i + 1][1], callback_data=f"lang:{codes[i + 1][0]}"),
+        ]
+        for i in range(0, len(codes) - 1, 2)
+    ]
+    if len(codes) % 2:
+        rows.append([InlineKeyboardButton(codes[-1][1], callback_data=f"lang:{codes[-1][0]}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def lang_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🌐 *Choose your preferred language:*\n"
+        "_Search results will prioritize shows in this language._",
+        reply_markup=_lang_keyboard(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cb_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid  = q.from_user.id
+    code = q.data.split(":", 1)[1]
+    lang_store.set_user_lang(uid, code)
+    name = lang_store.LANGUAGES.get(code, code)
+    await q.edit_message_text(
+        f"✅ Language set to *{name}*.\n\n"
+        "Now just type the name of any show to search!",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,6 +146,20 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user  = update.effective_user
     photo = next((u for u in WELCOME_IMAGES if u), FALLBACK_BANNER)
 
+    if not lang_store.get_user_lang(user.id):
+        await update.message.reply_text(
+            f"🎙️ *Welcome, {user.first_name}!*\n\n"
+            "Before we start, please set your preferred language with "
+            "/lang — search results will prioritize shows in that language.",
+            reply_markup=_lang_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    pages_line = (
+        f"\n🌐 *Web Player:* [Open Here]({GITHUB_PAGES_URL})\n"
+        if GITHUB_PAGES_URL else ""
+    )
 
     caption = (
         f"🎙️ *Welcome, {user.first_name}!*\n\n"
@@ -60,14 +169,13 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔍 *How to use:*\n"
         "  Just type the name of any show below.\n\n"
         "📥 *Tap a result* → pick an episode → download!\n"
+        f"{pages_line}"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "💡 *Try searching:*\n"
         "  • `Love Story`\n"
         "  • `Horror Night`\n"
         "  • `Motivational`\n\n"
-        "🚀 *Type your search below!\n\n*"
-        "🌐*Made By: @SmartBoy_ApnaMS*\n"
-        "*━━━━━━━━━━━━━━━━━━━━━━*"
+        "🚀 *Type your search below!*"
     )
 
     try:
@@ -105,6 +213,14 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN,
         )
         return
+
+    # Priority: shows matching the user's set language first, then the rest
+    # (original relevance order preserved within each group).
+    pref_lang = lang_store.get_user_lang(uid)
+    if pref_lang:
+        results = sorted(
+            results, key=lambda s: pfm.detect_language(s["title"]) != pref_lang
+        )
 
     user_state[uid] = {"query": query, "results": results, "page": 0}
     await _send_results(update, ctx, uid, edit=False)
@@ -149,14 +265,16 @@ async def _send_results(
         f"📄 Page {page+1}/{tpages} · {total} shows\n\n"
         "👇 Tap a show:"
     )
+    # Banner image: cover of the top result on this page.
+    image = page_r[0]["image_url"] if page_r and page_r[0].get("image_url") else None
+
     if edit and update.callback_query:
-        await update.callback_query.edit_message_text(
-            text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN
+        s["list_is_photo"] = await _edit_card(
+            update.callback_query, image, text, markup, s.get("list_is_photo", False)
         )
     else:
-        await update.message.reply_text(
-            text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN
-        )
+        msg, is_photo = await _reply_card(update.message, image, text, markup)
+        s["list_is_photo"] = is_photo
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -183,11 +301,13 @@ async def cb_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────────────────────
 async def cb_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    # Short toast instead of editing the message text/caption here — the
+    # message may now be a photo card, which edit_message_text can't touch
+    # (only edit_message_caption/edit_message_media can); _send_episodes()
+    # below replaces the content properly either way once data is ready.
+    await q.answer("⏳ Fetching episodes…")
     show_id = q.data.split(":", 1)[1]
     uid     = q.from_user.id
-
-    await q.edit_message_text("⏳ Fetching episodes…")
 
     loop    = asyncio.get_event_loop()
     ep_raw  = await loop.run_in_executor(None, pfm.get_episodes, show_id)
@@ -199,20 +319,34 @@ async def cb_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     episodes = pfm.parse_episodes(ep_raw)
 
     if not episodes:
-        await q.edit_message_text(
+        no_ep_text = (
             f"😕 No episodes found for *{title}*.\n"
-            "This show may require a login or be unavailable.",
-            parse_mode=ParseMode.MARKDOWN,
+            "This show may require a login or be unavailable."
         )
+        is_photo = user_state.get(uid, {}).get("list_is_photo", False)
+        await _edit_card(q, None, no_ep_text, None, is_photo)
         return
 
     if uid not in user_state:
         user_state[uid] = {}
+
+    # Cover image: pulled from the search result the user tapped (search
+    # results carry it; the episode-list response does not, at show level).
+    image_url = next(
+        (s["image_url"] for s in user_state[uid].get("results", []) if s["id"] == show_id),
+        None,
+    )
+
+    # The message being edited is whatever _send_results last made it (photo
+    # or text) — reuse that same state so the first _edit_card call below
+    # uses the right Telegram edit method for the message as it exists now.
     user_state[uid]["current_show"] = {
-        "id":       show_id,
-        "title":    title,
-        "episodes": episodes,
-        "ep_page":  0,
+        "id":        show_id,
+        "title":     title,
+        "image_url": image_url,
+        "episodes":  episodes,
+        "ep_page":   0,
+        "is_photo":  user_state[uid].get("list_is_photo", False),
     }
     await _send_episodes(q, uid)
 
@@ -245,13 +379,17 @@ async def _send_episodes(q, uid: int):
         buttons.append(nav)
     buttons.append([InlineKeyboardButton("🔙 Back to results", callback_data="back:search")])
 
+    lang_name = lang_store.LANGUAGES.get(pfm.detect_language(title), "")
+    lang_line = f"🌐 Language: {lang_name}\n" if lang_name else ""
     text = (
         f"📚 *{title}*\n"
+        f"{lang_line}"
         f"📄 Page {page+1}/{tpages} · {total} episodes\n\n"
         "👇 Tap an episode to download:"
     )
-    await q.edit_message_text(
-        text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN
+    markup = InlineKeyboardMarkup(buttons)
+    cs["is_photo"] = await _edit_card(
+        q, cs.get("image_url"), text, markup, cs.get("is_photo", False)
     )
 
 
@@ -281,6 +419,10 @@ async def cb_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
+    # Sync to the message's actual current state (set by _send_episodes)
+    # before _send_results edits it back to the results card.
+    cs = user_state.get(uid, {}).get("current_show", {})
+    user_state[uid]["list_is_photo"] = cs.get("is_photo", user_state[uid].get("list_is_photo", False))
     await _send_results(update, ctx, uid, edit=True)
 
 
@@ -419,6 +561,8 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("lang",  lang_cmd))
+    app.add_handler(CallbackQueryHandler(cb_lang,     pattern=r"^lang:"))
     app.add_handler(CallbackQueryHandler(cb_page,     pattern=r"^pg:"))
     app.add_handler(CallbackQueryHandler(cb_show,     pattern=r"^show:"))
     app.add_handler(CallbackQueryHandler(cb_ep_page,  pattern=r"^ep:"))
