@@ -268,13 +268,14 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔍 /search — find a show by name\n"
         "🔗 /download — open a show by link or ID\n"
         "🌐 /lang — change your preferred language\n"
-        f"{pages_line}"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "💡 *Try searching:*\n"
         "  • `Love Story`\n"
         "  • `Horror Night`\n"
         "  • `Motivational`\n\n"
         "🚀 *Or just type the name of any show below!*"
+        "✨*Bot Made By:*\n"
+        "*@SmartBoy_ApnaMS*"
     )
 
     try:
