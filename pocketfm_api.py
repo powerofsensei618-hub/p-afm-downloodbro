@@ -32,6 +32,7 @@ file will need the same network-capture process repeated (browser dev tools
 value and request body shape).
 """
 
+import http.cookiejar
 import json
 import logging
 import os
@@ -67,6 +68,85 @@ _HEADERS = {
 
 _session = requests.Session()
 _session.headers.update(_HEADERS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cookies.txt support — lets the session ride on a real pocketfm.com login,
+# same idea as kukufm-dl's HttpClientPair / kuku.py's MozillaCookieJar.
+# NOTE: this makes requests go out as a logged-in user; it does NOT unlock
+# coin-locked/paid episodes (that's a purchase gate, not a login gate) — it's
+# for session legitimacy (avoiding anonymous-session rate limits etc.), and
+# for any content that genuinely only requires being logged in.
+# ─────────────────────────────────────────────────────────────────────────────
+def load_cookies_file(path: str) -> int:
+    """
+    Load cookies into the shared session from either:
+      - a standard Netscape cookies.txt (what browser "export cookies"
+        extensions produce — tab-separated, works with MozillaCookieJar), or
+      - a raw `document.cookie`-style single line: "name=value; name2=value2"
+    Returns the number of cookies loaded (0 on failure).
+    """
+    try:
+        jar = http.cookiejar.MozillaCookieJar()
+        jar.load(path, ignore_discard=True, ignore_expires=True)
+        _session.cookies.update(jar)
+        count = len(list(jar))
+        if count:
+            logger.info(f"Loaded {count} cookies from Netscape-format {path}")
+            return count
+    except Exception:
+        pass  # not Netscape format — try the raw "k=v; k2=v2" fallback below
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        count = _load_cookie_header_string(raw)
+        if count:
+            logger.info(f"Loaded {count} cookies from raw cookie string in {path}")
+        return count
+    except Exception as e:
+        logger.error(f"load_cookies_file failed for {path}: {e}")
+        return 0
+
+
+def load_cookie_string(raw: str) -> int:
+    """Public entry point for loading a pasted raw cookie string (as opposed
+    to a cookies.txt file — see load_cookies_file())."""
+    return _load_cookie_header_string(raw)
+
+
+def _load_cookie_header_string(raw: str) -> int:
+    count = 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        for pair in line.split(";"):
+            pair = pair.strip()
+            if "=" not in pair:
+                continue
+            name, _, value = pair.partition("=")
+            name, value = name.strip(), value.strip()
+            if name:
+                _session.cookies.set(name, value, domain="pocketfm.com")
+                count += 1
+    return count
+
+
+def cookie_header_for(domain_hint: str = "") -> str:
+    """Build a 'name=value; name2=value2' Cookie header from the loaded
+    jar — ffmpeg (used for HLS downloads) doesn't share Python's requests
+    cookie jar, so the download path passes this through explicitly."""
+    parts = [f"{c.name}={c.value}" for c in _session.cookies]
+    return "; ".join(parts)
+
+
+def has_cookies() -> bool:
+    return len(_session.cookies) > 0
+
+
+def cookie_count() -> int:
+    return len(_session.cookies)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,13 +281,10 @@ def get_episodes(show_id: str, curr_ptr: int = 0, page_size: int = 50) -> dict:
 # DOWNLOAD
 # ────────────────────────────────────────────────────────────────────────────
 def _download_direct(stream_url: str, dest_path: str) -> bool:
-    """Plain streamed HTTP download — for direct audio file URLs (mp3/aac)."""
-    dl_headers = {
-        "User-Agent": _HEADERS["User-Agent"],
-        "Accept": "*/*",
-        "Range": "bytes=0-",
-    }
-    with requests.get(
+    """Plain streamed HTTP download — for direct audio file URLs (mp3/aac).
+    Uses the shared session so any loaded cookies ride along."""
+    dl_headers = {"Accept": "*/*", "Range": "bytes=0-"}
+    with _session.get(
         stream_url, headers=dl_headers, stream=True, timeout=120, allow_redirects=True
     ) as r:
         r.raise_for_status()
@@ -224,10 +301,26 @@ def _download_hls(stream_url: str, dest_path: str) -> bool:
     file via ffmpeg. A plain HTTP GET on an .m3u8 URL only saves the
     playlist text, not the actual audio — this is why episodes were
     "downloading" a few hundred bytes of garbage before.
+
+    ffmpeg's own HLS demuxer resolves the master/media playlist, fetches
+    every .ts segment and concatenates them in one step — equivalent to
+    (and more battle-tested than) hand-rolling segment-by-segment
+    downloading. -reconnect* flags add resilience against flaky CDN drops
+    mid-stream; cookies ride along via an explicit header since ffmpeg
+    doesn't share Python's requests cookie jar.
     """
+    headers = f"User-Agent: {_HEADERS['User-Agent']}\r\n"
+    cookie_hdr = cookie_header_for()
+    if cookie_hdr:
+        headers += f"Cookie: {cookie_hdr}\r\n"
+
     cmd = [
         "ffmpeg", "-y",
-        "-user_agent", _HEADERS["User-Agent"],
+        "-headers", headers,
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_on_network_error", "1",
+        "-reconnect_delay_max", "5",
         "-i", stream_url,
         "-vn",                 # drop video track — this is an audio download
         "-acodec", "libmp3lame",
@@ -235,11 +328,45 @@ def _download_hls(stream_url: str, dest_path: str) -> bool:
         "-loglevel", "error",
         dest_path,
     ]
-    proc = subprocess.run(cmd, capture_output=True, timeout=300)
-    if proc.returncode != 0:
-        logger.error(f"ffmpeg failed [{stream_url[:60]}]: {proc.stderr.decode(errors='ignore')[:500]}")
-        return False
-    return True
+
+    last_err = ""
+    for attempt in range(2):  # one retry on transient CDN failures
+        proc = subprocess.run(cmd, capture_output=True, timeout=300)
+        if proc.returncode == 0:
+            return True
+        last_err = proc.stderr.decode(errors="ignore")[:500]
+        if attempt == 0:
+            time.sleep(2)
+    logger.error(f"ffmpeg failed [{stream_url[:60]}]: {last_err}")
+    return False
+
+
+def tag_audio(file_path: str, title: str, artist: str, album: str, cover_url: str = "") -> None:
+    """Write ID3 tags (title/artist/album/cover art) onto a downloaded mp3,
+    so it shows up properly in Telegram's audio player and any music app.
+    Best-effort — a tagging failure never blocks the download/upload flow."""
+    try:
+        from mutagen.id3 import ID3, ID3NoHeaderError, TIT2, TPE1, TALB, APIC
+    except ImportError:
+        logger.warning("mutagen not installed — skipping audio tagging")
+        return
+    try:
+        try:
+            tags = ID3(file_path)
+        except ID3NoHeaderError:
+            tags = ID3()
+        tags["TIT2"] = TIT2(encoding=3, text=title)
+        tags["TPE1"] = TPE1(encoding=3, text=artist)
+        tags["TALB"] = TALB(encoding=3, text=album)
+        if cover_url:
+            try:
+                img = _session.get(cover_url, timeout=15).content
+                tags["APIC"] = APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=img)
+            except Exception as e:
+                logger.warning(f"tag_audio: cover fetch failed: {e}")
+        tags.save(file_path)
+    except Exception as e:
+        logger.warning(f"tag_audio failed: {e}")
 
 
 def download_audio(stream_url: str, dest_path: str) -> bool:
@@ -289,24 +416,62 @@ _SCRIPT_RANGES = [
 ]
 
 
-def detect_language(title: str) -> str:
-    """Best-effort language code for a show, from its title. See notes above."""
-    if not title:
-        return "hindi"
-
-    m = _LANG_TAG_RE.search(title.strip())
-    if m:
-        tag = m.group(1).lower()
-        if tag in _LANG_TAG_MAP:
-            return _LANG_TAG_MAP[tag]
-
-    for ch in title:
+def _script_lang(text: str) -> Optional[str]:
+    """Language code from the first non-Latin script character found, or
+    None if the text is pure Latin script (no signal either way)."""
+    for ch in text:
         cp = ord(ch)
         for lo, hi, lang in _SCRIPT_RANGES:
             if lo <= cp <= hi:
                 return lang
+    return None
 
-    return "hindi"
+
+def detect_language(title: str) -> str:
+    """
+    Best-effort language code for a SHOW, from its title. See module notes
+    above. Defaults to "hindi" when there's no tag/script signal, since
+    that's PocketFM's primary, majority-untagged catalog language.
+    """
+    if not title:
+        return "hindi"
+    m = _LANG_TAG_RE.search(title.strip())
+    if m and m.group(1).lower() in _LANG_TAG_MAP:
+        return _LANG_TAG_MAP[m.group(1).lower()]
+    return _script_lang(title) or "hindi"
+
+
+def query_language(query: str) -> Optional[str]:
+    """
+    Best-effort language code for a SEARCH QUERY the user typed. Unlike
+    detect_language(), this returns None (no guess) for plain Latin-script
+    queries like "Avatar" — a Latin query gives no real language signal, so
+    callers should fall back to the user's set /lang preference instead of
+    assuming "hindi". Only a query actually written in a distinct Indic
+    script (e.g. Devanagari, Tamil, ...) returns a language here.
+    """
+    if not query:
+        return None
+    return _script_lang(query)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# SHOW ID / URL PARSING
+# ────────────────────────────────────────────────────────────────────────────
+# PocketFM show IDs are 40-char hex strings, e.g.
+#   https://pocketfm.com/show/5e8f749e24f0c94a6fc09f375b9e3edc1bb5d71a
+#   https://pocketfm.com/the-beast-guru/460702ff409f87d178f7821534c645030c2db71e
+# This matches the raw ID alone too, so it works whether the user pastes a
+# full show URL or just the ID off the end of one.
+_SHOW_ID_RE = re.compile(r"\b([0-9a-fA-F]{40})\b")
+
+
+def extract_show_id(text: str) -> Optional[str]:
+    """Pull a 40-hex-char PocketFM show ID out of a pasted URL or raw ID."""
+    if not text:
+        return None
+    m = _SHOW_ID_RE.search(text.strip())
+    return m.group(1) if m else None
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -389,5 +554,9 @@ def parse_episodes(raw: dict) -> list[dict]:
             "media_url":  ep.get("media_url") or "",
             "hls_url":    ep.get("hls_url") or "",
             "is_locked":  bool(ep.get("is_locked")),
+            # Usually the show cover, repeated per story — used as a
+            # fallback show image when a show wasn't reached via search
+            # (e.g. opened directly by ID/URL via /download).
+            "image_url":  ep.get("image_url") or "",
         })
     return results

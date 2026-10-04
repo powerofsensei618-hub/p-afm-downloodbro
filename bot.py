@@ -31,9 +31,16 @@ from config import (
     FALLBACK_BANNER,
     RESULTS_PER_PAGE,
     GITHUB_PAGES_URL,
+    ADMIN_USER_ID,
 )
 import pocketfm_api as pfm
 import lang_store
+
+# Bot-wide cookies.txt location — set via /cookies, survives for the life of
+# the running instance (same ephemeral-disk caveat as lang_store.py).
+_COOKIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+if os.path.exists(_COOKIES_PATH):
+    pfm.load_cookies_file(_COOKIES_PATH)
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -43,7 +50,9 @@ logger = logging.getLogger(__name__)
 
 # ── In-memory session state ───────────────────────────────────────────────────
 # uid → { query, results, page, list_is_photo,
-#         current_show: { id, title, image_url, episodes, ep_page, is_photo } }
+#         current_show: { id, title, image_url, episodes, ep_page, is_photo },
+#         awaiting_search, awaiting_show_id, awaiting_cookies  (one-shot flags
+#         set by /search, /download, /cookies — consumed by the next message) }
 user_state: dict[int, dict] = {}
 
 
@@ -131,12 +140,102 @@ async def cb_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = q.from_user.id
     code = q.data.split(":", 1)[1]
     lang_store.set_user_lang(uid, code)
+
+    # Verify the write actually landed (read-only disk / IO errors on some
+    # hosts fail silently otherwise, which is what made /lang look like it
+    # "wasn't changing" — now it tells you instead of lying).
+    saved = lang_store.get_user_lang(uid)
+    if saved != code:
+        await q.edit_message_text(
+            "⚠️ Couldn't save your language preference (storage error on the "
+            "server). Please try /lang again.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
     name = lang_store.LANGUAGES.get(code, code)
     await q.edit_message_text(
         f"✅ Language set to *{name}*.\n\n"
-        "Now just type the name of any show to search!",
+        "Now just type the name of any show to search, or use /search!",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /search — prompt, then treat the next message as the search query
+# ─────────────────────────────────────────────────────────────────────────────
+async def search_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user_state.setdefault(uid, {})["awaiting_search"] = True
+    await update.message.reply_text(
+        "🔍 *Type the name of any show to search:*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /download — open a show directly by its PocketFM link or 40-char show ID
+# ─────────────────────────────────────────────────────────────────────────────
+async def download_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user_state.setdefault(uid, {})["awaiting_show_id"] = True
+    await update.message.reply_text(
+        "🔗 *Open a story*\n\n"
+        "Paste a Pocket FM show link or a 40-character show ID.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /cookies — load a pocketfm.com session (cookies.txt or raw cookie string)
+# so requests ride on a real logged-in session. Bot-wide, not per-user.
+# Does NOT unlock paid/coin-locked episodes — that's a purchase gate, not a
+# login gate.
+# ─────────────────────────────────────────────────────────────────────────────
+def _is_admin(uid: int) -> bool:
+    return ADMIN_USER_ID is None or uid == ADMIN_USER_ID
+
+
+async def cookies_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _is_admin(uid):
+        await update.message.reply_text("🚫 Only the bot admin can set cookies.")
+        return
+    user_state.setdefault(uid, {})["awaiting_cookies"] = True
+    status = (
+        f"Currently loaded: {pfm.cookie_count()} cookies."
+        if pfm.has_cookies() else "No cookies loaded yet."
+    )
+    await update.message.reply_text(
+        "🍪 *Set PocketFM cookies*\n\n"
+        "Send your `cookies.txt` file (Netscape format — export it from "
+        "your browser after logging in to pocketfm.com) as a *document*, "
+        "or paste the raw `document.cookie` string here as text.\n\n"
+        f"_{status}_\n\n"
+        "_Note: this sets the session for the whole bot, and only makes "
+        "requests look like a logged-in user — it does not unlock paid/"
+        "coin-locked episodes, those still require purchase on PocketFM._",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def handle_cookies_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not (user_state.get(uid, {}).pop("awaiting_cookies", False) and _is_admin(uid)):
+        return  # not something we asked for — ignore silently
+
+    doc = update.message.document
+    tg_file = await ctx.bot.get_file(doc.file_id)
+    await tg_file.download_to_drive(_COOKIES_PATH)
+
+    count = pfm.load_cookies_file(_COOKIES_PATH)
+    if count:
+        await update.message.reply_text(f"✅ Loaded {count} cookies.")
+    else:
+        await update.message.reply_text(
+            "😕 Couldn't parse any cookies from that file.\n"
+            "Make sure it's a Netscape-format cookies.txt export."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,16 +265,16 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "✨ Search & download any audio story, podcast or audiobook\n"
         "from *Pocket FM* — instantly, for free.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔍 *How to use:*\n"
-        "  Just type the name of any show below.\n\n"
-        "📥 *Tap a result* → pick an episode → download!\n"
+        "🔍 /search — find a show by name\n"
+        "🔗 /download — open a show by link or ID\n"
+        "🌐 /lang — change your preferred language\n"
+        f"{pages_line}"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "💡 *Try searching:*\n"
         "  • `Love Story`\n"
         "  • `Horror Night`\n"
         "  • `Motivational`\n\n"
-        "🚀 *Type your search below!*\n\n"
-        "✨*Bot Made By: @SmartBoy_ApnaMS*"
+        "🚀 *Or just type the name of any show below!*"
     )
 
     try:
@@ -189,13 +288,107 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Text search handler
+# Shared: fetch a show's episodes by ID into user_state (used by cb_show,
+# the direct /download-by-ID flow, and nowhere else — single source of truth
+# for "what does opening a show actually do").
 # ─────────────────────────────────────────────────────────────────────────────
-async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.message.text.strip()
-    if not query:
+async def _load_show(uid: int, show_id: str) -> tuple[bool, str]:
+    """Returns (ok, title_or_blank). On success, user_state[uid]['current_show']
+    is populated and ready for _send_episodes()."""
+    loop   = asyncio.get_event_loop()
+    ep_raw = await loop.run_in_executor(None, pfm.get_episodes, show_id)
+
+    # pocketfm.com has no standalone show-details endpoint — the title is
+    # bundled into the episode-list response itself.
+    title    = ep_raw.get("show_title") or "Unknown Show"
+    episodes = pfm.parse_episodes(ep_raw)
+    if not episodes:
+        return False, title
+
+    st = user_state.setdefault(uid, {})
+
+    # Cover image: prefer the search result the user tapped (search results
+    # carry it; the episode-list response doesn't, at show level) — falling
+    # back to the per-episode image (same cover, repeated) for shows opened
+    # directly by ID/URL via /download, which skip search entirely.
+    image_url = next(
+        (s["image_url"] for s in st.get("results", []) if s["id"] == show_id),
+        None,
+    ) or next((e["image_url"] for e in episodes if e.get("image_url")), None)
+
+    st["current_show"] = {
+        "id":        show_id,
+        "title":     title,
+        "image_url": image_url,
+        "episodes":  episodes,
+        "ep_page":   0,
+        # The message being edited (if any) is whatever it already is —
+        # _send_episodes()'s caller decides edit-vs-new and passes the right
+        # starting state.
+        "is_photo":  st.get("list_is_photo", False),
+    }
+    return True, title
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Text message dispatcher — routes to whichever one-shot flag is pending
+# (/search, /download, /cookies), else treats the text as a search query.
+# ─────────────────────────────────────────────────────────────────────────────
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    uid = update.effective_user.id
+    st  = user_state.setdefault(uid, {})
+
+    if st.pop("awaiting_cookies", False) and _is_admin(uid):
+        count = pfm.load_cookie_string(text)
+        if count:
+            with open(_COOKIES_PATH, "w", encoding="utf-8") as f:
+                f.write(text)
+            await update.message.reply_text(f"✅ Loaded {count} cookies.")
+        else:
+            await update.message.reply_text(
+                "😕 Couldn't find any `name=value` cookie pairs in that text."
+            )
         return
 
+    if st.pop("awaiting_show_id", False):
+        await _handle_direct_show(update, uid, text)
+        return
+
+    st.pop("awaiting_search", None)  # consumed either way
+    await handle_search(update, ctx, text)
+
+
+async def _handle_direct_show(update: Update, uid: int, text: str):
+    show_id = pfm.extract_show_id(text)
+    if not show_id:
+        await update.message.reply_text(
+            "😕 Couldn't find a valid show ID in that.\n"
+            "Paste a Pocket FM show link or the 40-character show ID.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    wait = await update.message.reply_text("🔎 Fetching show…", parse_mode=ParseMode.MARKDOWN)
+    ok, title = await _load_show(uid, show_id)
+    await wait.delete()
+
+    if not ok:
+        await update.message.reply_text(
+            f"😕 No episodes found for *{title}*.\nCheck the ID/link and try again.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await _send_episodes(uid, reply_message=update.message)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Search
+# ─────────────────────────────────────────────────────────────────────────────
+async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
     uid = update.effective_user.id
     wait = await update.message.reply_text(
         f"🔍 Searching *{query}*…", parse_mode=ParseMode.MARKDOWN
@@ -214,15 +407,20 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Priority: shows matching the user's set language first, then the rest
-    # (original relevance order preserved within each group).
-    pref_lang = lang_store.get_user_lang(uid)
-    if pref_lang:
+    # Priority language: if the query itself is written in a distinct script
+    # (e.g. Devanagari, Tamil...) that wins — the person is explicitly asking
+    # for that language regardless of their saved /lang preference. Only when
+    # the query gives no signal (plain Latin text like "Avatar") do we fall
+    # back to the saved preference. Either way, non-matching results stay
+    # below (not hidden) — original relevance order preserved within each
+    # group, via a stable sort.
+    effective_lang = pfm.query_language(query) or lang_store.get_user_lang(uid)
+    if effective_lang:
         results = sorted(
-            results, key=lambda s: pfm.detect_language(s["title"]) != pref_lang
+            results, key=lambda s: pfm.detect_language(s["title"]) != effective_lang
         )
 
-    user_state[uid] = {"query": query, "results": results, "page": 0}
+    user_state[uid] = {**user_state.get(uid, {}), "query": query, "results": results, "page": 0}
     await _send_results(update, ctx, uid, edit=False)
 
 
@@ -309,16 +507,8 @@ async def cb_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     show_id = q.data.split(":", 1)[1]
     uid     = q.from_user.id
 
-    loop    = asyncio.get_event_loop()
-    ep_raw  = await loop.run_in_executor(None, pfm.get_episodes, show_id)
-
-    # pocketfm.com has no standalone show-details endpoint — the title is
-    # bundled into the episode-list response itself.
-    title = ep_raw.get("show_title") or "Unknown Show"
-
-    episodes = pfm.parse_episodes(ep_raw)
-
-    if not episodes:
+    ok, title = await _load_show(uid, show_id)
+    if not ok:
         no_ep_text = (
             f"😕 No episodes found for *{title}*.\n"
             "This show may require a login or be unavailable."
@@ -327,34 +517,15 @@ async def cb_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _edit_card(q, None, no_ep_text, None, is_photo)
         return
 
-    if uid not in user_state:
-        user_state[uid] = {}
-
-    # Cover image: pulled from the search result the user tapped (search
-    # results carry it; the episode-list response does not, at show level).
-    image_url = next(
-        (s["image_url"] for s in user_state[uid].get("results", []) if s["id"] == show_id),
-        None,
-    )
-
-    # The message being edited is whatever _send_results last made it (photo
-    # or text) — reuse that same state so the first _edit_card call below
-    # uses the right Telegram edit method for the message as it exists now.
-    user_state[uid]["current_show"] = {
-        "id":        show_id,
-        "title":     title,
-        "image_url": image_url,
-        "episodes":  episodes,
-        "ep_page":   0,
-        "is_photo":  user_state[uid].get("list_is_photo", False),
-    }
-    await _send_episodes(q, uid)
+    await _send_episodes(uid, q=q)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Episode list page
+# Episode list page — edits an existing callback-query message (q) or sends
+# a fresh one (reply_message), e.g. when a show was opened directly via
+# /download instead of by tapping a search result.
 # ─────────────────────────────────────────────────────────────────────────────
-async def _send_episodes(q, uid: int):
+async def _send_episodes(uid: int, q=None, reply_message=None):
     cs       = user_state[uid]["current_show"]
     episodes = cs["episodes"]
     page     = cs.get("ep_page", 0)
@@ -388,9 +559,13 @@ async def _send_episodes(q, uid: int):
         "👇 Tap an episode to download:"
     )
     markup = InlineKeyboardMarkup(buttons)
-    cs["is_photo"] = await _edit_card(
-        q, cs.get("image_url"), text, markup, cs.get("is_photo", False)
-    )
+    if q is not None:
+        cs["is_photo"] = await _edit_card(
+            q, cs.get("image_url"), text, markup, cs.get("is_photo", False)
+        )
+    else:
+        msg, is_photo = await _reply_card(reply_message, cs.get("image_url"), text, markup)
+        cs["is_photo"] = is_photo
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -409,7 +584,7 @@ async def cb_ep_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cs["ep_page"] = cs.get("ep_page", 0) + 1
     else:
         cs["ep_page"] = max(0, cs.get("ep_page", 0) - 1)
-    await _send_episodes(q, uid)
+    await _send_episodes(uid, q=q)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -503,7 +678,13 @@ async def cb_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # 3. Upload
+        # 3. Tag (title/artist/album/cover) so it looks right in any player
+        await loop.run_in_executor(
+            None, pfm.tag_audio, tmp_path, ep_title, show_title, show_title,
+            cs.get("image_url") or "",
+        )
+
+        # 4. Upload
         await prog.edit_text(
             f"📤 *Uploading to Telegram…*\n🎧 *{ep_title}*",
             parse_mode=ParseMode.MARKDOWN,
@@ -560,15 +741,19 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("lang",  lang_cmd))
+    app.add_handler(CommandHandler("start",    start))
+    app.add_handler(CommandHandler("search",   search_cmd))
+    app.add_handler(CommandHandler("download", download_cmd))
+    app.add_handler(CommandHandler("lang",     lang_cmd))
+    app.add_handler(CommandHandler("cookies",  cookies_cmd))
     app.add_handler(CallbackQueryHandler(cb_lang,     pattern=r"^lang:"))
     app.add_handler(CallbackQueryHandler(cb_page,     pattern=r"^pg:"))
     app.add_handler(CallbackQueryHandler(cb_show,     pattern=r"^show:"))
     app.add_handler(CallbackQueryHandler(cb_ep_page,  pattern=r"^ep:"))
     app.add_handler(CallbackQueryHandler(cb_download, pattern=r"^dl:"))
     app.add_handler(CallbackQueryHandler(cb_back,     pattern=r"^back:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_cookies_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("🚀 PocketFM Bot started.")
     # stop_signals=None: run_polling() normally registers OS signal handlers
