@@ -4,6 +4,7 @@ Uses PocketFM API reverse-engineered from com.radio.pocketfm APK v3.69
 """
 
 import os
+import re
 import logging
 import random
 import asyncio
@@ -47,6 +48,19 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# Episodes are fetched from pocketfm.com in pages of this size (the show page
+# loads 10 at a time; the "load more" action takes a page size).
+EP_PAGE_SIZE = 50
+# Telegram bot upload limit
+TG_MAX_MB = 49
+
+
+def _md(text) -> str:
+    """Escape text for Telegram's legacy Markdown so titles / names containing
+    _ * ` [ can never break a message ("can't parse entities")."""
+    return re.sub(r"([_*`\[])", r"\\\1", str(text or ""))
+
 
 # ── In-memory session state ───────────────────────────────────────────────────
 # uid → { query, results, page, list_is_photo,
@@ -247,7 +261,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if not lang_store.get_user_lang(user.id):
         await update.message.reply_text(
-            f"🎙️ *Welcome, {user.first_name}!*\n\n"
+            f"🎙️ *Welcome, {_md(user.first_name)}!*\n\n"
             "Before we start, please set your preferred language with "
             "/lang — search results will prioritize shows in that language.",
             reply_markup=_lang_keyboard(),
@@ -261,7 +275,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     caption = (
-        f"🎙️ *Welcome, {user.first_name}!*\n\n"
+        f"🎙️ *Welcome, {_md(user.first_name)}!*\n\n"
         "✨ Search & download any audio story, podcast or audiobook\n"
         "from *Pocket FM* — instantly, for free.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -295,14 +309,17 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────────────────────
 async def _load_show(uid: int, show_id: str) -> tuple[bool, str]:
     """Returns (ok, title_or_blank). On success, user_state[uid]['current_show']
-    is populated and ready for _send_episodes()."""
-    loop   = asyncio.get_event_loop()
-    ep_raw = await loop.run_in_executor(None, pfm.get_episodes, show_id)
+    is populated and ready for _send_episodes().
 
-    # pocketfm.com has no standalone show-details endpoint — the title is
-    # bundled into the episode-list response itself.
-    title    = ep_raw.get("show_title") or "Unknown Show"
-    episodes = pfm.parse_episodes(ep_raw)
+    Only the FIRST page of episodes is fetched here (fast). The rest of the
+    list - however long, some shows have 4000+ episodes - is fetched page by page
+    by _ensure_range() as the user browses / jumps, so every episode is reachable.
+    """
+    loop = asyncio.get_event_loop()
+    page = await loop.run_in_executor(None, pfm.fetch_episode_page, show_id, 0, EP_PAGE_SIZE)
+
+    title    = page["title"] or "Unknown Show"
+    episodes = page["episodes"]
     if not episodes:
         return False, title
 
@@ -317,11 +334,22 @@ async def _load_show(uid: int, show_id: str) -> tuple[bool, str]:
         None,
     ) or next((e["image_url"] for e in episodes if e.get("image_url")), None)
 
+    total_known = bool(page["total"])
+    total = max(page["total"], len(episodes))
     st["current_show"] = {
         "id":        show_id,
         "title":     title,
+        "language":  page.get("language") or "",
         "image_url": image_url,
-        "episodes":  episodes,
+        # episode index (0-based) -> episode dict; filled page by page
+        "eps":       {i: ep for i, ep in enumerate(episodes)},
+        "total":     total,
+        "total_known": total_known,
+        "frontier":  len(episodes),   # indexes 0..frontier-1 are all loaded
+        "next_ptr":  page["next_ptr"] if page["next_ptr"] is not None else len(episodes),
+        "done":      (not total_known) and page["next_ptr"] is None,
+        "random_ok": None,            # can an arbitrary page offset be fetched? (checked once)
+        "lock":      asyncio.Lock(),
         "ep_page":   0,
         # The message being edited (if any) is whatever it already is —
         # _send_episodes()'s caller decides edit-vs-new and passes the right
@@ -329,6 +357,74 @@ async def _load_show(uid: int, show_id: str) -> tuple[bool, str]:
         "is_photo":  st.get("list_is_photo", False),
     }
     return True, title
+
+
+def _find_ep(cs: dict, episode_id: str):
+    """(index, episode dict) of an episode id in the loaded list, or (None, None)."""
+    for idx, ep in cs.get("eps", {}).items():
+        if ep["id"] == episode_id:
+            return idx, ep
+    return None, None
+
+
+async def _ensure_range(cs: dict, start: int, end: int) -> None:
+    """Make sure episodes [start, end) are loaded, fetching pages from pocketfm.com
+    as needed. Jumping far ahead (e.g. to episode 3000 of 4192) fetches that page
+    directly when the server supports random offsets (verified once per show by
+    checking the first returned episode number); otherwise it walks the pages with the
+    server's own next_ptr."""
+    loop = asyncio.get_event_loop()
+    async with cs["lock"]:
+        for _ in range(120):  # hard stop - a run-away loop must never hang the bot
+            hi = min(end, cs["total"]) if cs["total_known"] else end
+            missing = next((i for i in range(start, hi) if i not in cs["eps"]), None)
+            if missing is None or cs["done"]:
+                return
+
+            random_mode = cs["random_ok"] is not False
+            if random_mode:
+                ptr, base = missing, missing
+            else:
+                ptr = cs["next_ptr"] if cs["next_ptr"] is not None else cs["frontier"]
+                base = cs["frontier"]
+
+            page = await loop.run_in_executor(
+                None, pfm.fetch_episode_page, cs["id"], ptr, EP_PAGE_SIZE
+            )
+            eps = page["episodes"]
+
+            if not eps:
+                if random_mode and cs["random_ok"] is None:
+                    cs["random_ok"] = False      # maybe offsets are not supported - go sequential
+                    continue
+                if cs["total_known"] and base < cs["total"]:
+                    logger.warning(f"episode page at {ptr} came back empty - will retry on next click")
+                else:
+                    cs["done"] = True
+                    cs["total"], cs["total_known"] = (max(cs["eps"]) + 1 if cs["eps"] else 0), True
+                return
+
+            if random_mode and cs["random_ok"] is None and ptr > 0:
+                try:
+                    first_no = int(eps[0]["number"])
+                except (TypeError, ValueError):
+                    first_no = None
+                if first_no != ptr + 1:
+                    cs["random_ok"] = False      # offsets don't map 1:1 - redo with next_ptr
+                    continue
+                cs["random_ok"] = True
+
+            contiguous = base <= cs["frontier"]   # this page extends the 0..frontier block
+            for i, ep in enumerate(eps):
+                cs["eps"][base + i] = ep
+            while cs["frontier"] in cs["eps"]:
+                cs["frontier"] += 1
+            if contiguous:
+                cs["next_ptr"] = page["next_ptr"]
+                if page["next_ptr"] is None and not cs["total_known"]:
+                    cs["done"] = True
+            if base + len(eps) > cs["total"]:
+                cs["total"] = base + len(eps)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,6 +452,16 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if st.pop("awaiting_show_id", False):
         await _handle_direct_show(update, uid, text)
+        return
+
+    if st.pop("awaiting_jump", False) and st.get("current_show"):
+        cs = st["current_show"]
+        if text.isdigit() and int(text) >= 1:
+            number = min(int(text), cs["total"])
+            cs["ep_page"] = (number - 1) // RESULTS_PER_PAGE
+            await _send_episodes(uid, reply_message=update.message)
+        else:
+            await update.message.reply_text("😕 Send just an episode number, e.g. `250`.", parse_mode=ParseMode.MARKDOWN)
         return
 
     st.pop("awaiting_search", None)  # consumed either way
@@ -389,37 +495,50 @@ async def _handle_direct_show(update: Update, uid: int, text: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # Search
 # ─────────────────────────────────────────────────────────────────────────────
+def _lang_rank(title: str, lang: str) -> int:
+    """0 = show is in the wanted language, 1 = language unknown, 2 = another language."""
+    guess = pfm.guess_language(title)
+    if guess == lang:
+        return 0
+    return 1 if guess is None else 2
+
+
 async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
     uid = update.effective_user.id
     wait = await update.message.reply_text(
-        f"🔍 Searching *{query}*…", parse_mode=ParseMode.MARKDOWN
+        f"🔍 Searching *{_md(query)}*…", parse_mode=ParseMode.MARKDOWN
     )
 
+    # Priority language: if the query itself is written in a distinct script
+    # (e.g. Devanagari, Tamil...) that wins — the person is explicitly asking
+    # for that language regardless of their saved /lang preference. Only when
+    # the query gives no signal (plain Latin text like "Avatar") do we fall
+    # back to the saved preference ("all" = no preference).
+    effective_lang = pfm.query_language(query) or lang_store.get_user_lang(uid)
+    if effective_lang == "all":
+        effective_lang = None
+
+    # The site answers a search with ONE language only (English by default), so
+    # search_multi() asks for the wanted language as well as the default one and
+    # merges the answers - every language shows up, the wanted one first.
     loop = asyncio.get_event_loop()
-    raw     = await loop.run_in_executor(None, pfm.search_shows, query)
+    raw     = await loop.run_in_executor(None, pfm.search_multi, query, effective_lang)
     results = pfm.parse_search_results(raw)
 
     await wait.delete()
 
     if not results:
         await update.message.reply_text(
-            f"😕 No results for *{query}*.\nTry a different keyword.",
+            f"😕 No results for *{_md(query)}*.\nTry a different keyword.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    # Priority language: if the query itself is written in a distinct script
-    # (e.g. Devanagari, Tamil...) that wins — the person is explicitly asking
-    # for that language regardless of their saved /lang preference. Only when
-    # the query gives no signal (plain Latin text like "Avatar") do we fall
-    # back to the saved preference. Either way, non-matching results stay
-    # below (not hidden) — original relevance order preserved within each
-    # group, via a stable sort.
-    effective_lang = pfm.query_language(query) or lang_store.get_user_lang(uid)
+    # Wanted language first, then untagged shows, then the other languages —
+    # nothing is hidden, original relevance order is kept inside each group
+    # (stable sort).
     if effective_lang:
-        results = sorted(
-            results, key=lambda s: pfm.detect_language(s["title"]) != effective_lang
-        )
+        results = sorted(results, key=lambda s: _lang_rank(s["title"], effective_lang))
 
     user_state[uid] = {**user_state.get(uid, {}), "query": query, "results": results, "page": 0}
     await _send_results(update, ctx, uid, edit=False)
@@ -460,7 +579,7 @@ async def _send_results(
 
     markup = InlineKeyboardMarkup(buttons)
     text = (
-        f"🎵 Results for: `{query}`\n"
+        f"🎵 Results for: `{query.replace(chr(96), chr(39))}`\n"
         f"📄 Page {page+1}/{tpages} · {total} shows\n\n"
         "👇 Tap a show:"
     )
@@ -527,17 +646,23 @@ async def cb_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # /download instead of by tapping a search result.
 # ─────────────────────────────────────────────────────────────────────────────
 async def _send_episodes(uid: int, q=None, reply_message=None):
-    cs       = user_state[uid]["current_show"]
-    episodes = cs["episodes"]
-    page     = cs.get("ep_page", 0)
-    title    = cs["title"]
-    total    = len(episodes)
-    si       = page * RESULTS_PER_PAGE
-    ei       = min(si + RESULTS_PER_PAGE, total)
-    tpages   = (total + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
+    cs    = user_state[uid]["current_show"]
+    title = cs["title"]
+
+    # clamp the page, make sure its episodes are loaded (fetches from pocketfm.com
+    # on demand), then clamp again - the real total may turn out smaller
+    for _ in range(2):
+        total  = cs["total"]
+        tpages = max(1, (total + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE)
+        page   = min(max(0, cs.get("ep_page", 0)), tpages - 1)
+        cs["ep_page"] = page
+        si = page * RESULTS_PER_PAGE
+        ei = min(si + RESULTS_PER_PAGE, total)
+        await _ensure_range(cs, si, ei)
+    shown = [cs["eps"][i] for i in range(si, ei) if i in cs["eps"]]
 
     buttons = []
-    for ep in episodes[si:ei]:
+    for ep in shown:
         num = f"{ep['number']}. " if ep["number"] else ""
         lbl = f"🎧 {num}{ep['title']}"
         buttons.append([InlineKeyboardButton(lbl[:64], callback_data=f"dl:{ep['id']}")])
@@ -545,18 +670,26 @@ async def _send_episodes(uid: int, q=None, reply_message=None):
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀️ Prev", callback_data="ep:prev"))
-    if ei < total:
+    if page < tpages - 1:
         nav.append(InlineKeyboardButton("Next ▶️", callback_data="ep:next"))
     if nav:
         buttons.append(nav)
+    if tpages > 3:  # long shows: big jumps instead of tapping Next hundreds of times
+        buttons.append([
+            InlineKeyboardButton("⏪ -10 pages", callback_data="ep:m10"),
+            InlineKeyboardButton("🔢 Go to episode", callback_data="ep:jump"),
+            InlineKeyboardButton("+10 pages ⏩", callback_data="ep:p10"),
+        ])
     buttons.append([InlineKeyboardButton("🔙 Back to results", callback_data="back:search")])
 
-    lang_name = lang_store.LANGUAGES.get(pfm.detect_language(title), "")
+    lang_code = (cs.get("language") or "").lower() or pfm.detect_language(title)
+    lang_name = lang_store.LANGUAGES.get(lang_code, "")
     lang_line = f"🌐 Language: {lang_name}\n" if lang_name else ""
+    count_txt = f"{total}" if cs["total_known"] else f"{total}+"
     text = (
-        f"📚 *{title}*\n"
+        f"📚 *{_md(title)}*\n"
         f"{lang_line}"
-        f"📄 Page {page+1}/{tpages} · {total} episodes\n\n"
+        f"📄 Page {page+1}/{tpages} · {count_txt} episodes\n\n"
         "👇 Tap an episode to download:"
     )
     markup = InlineKeyboardMarkup(buttons)
@@ -574,17 +707,33 @@ async def _send_episodes(uid: int, q=None, reply_message=None):
 # ─────────────────────────────────────────────────────────────────────────────
 async def cb_ep_page(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
-    await q.answer()
     uid = q.from_user.id
     cs  = user_state.get(uid, {}).get("current_show")
     if not cs:
         await q.answer("Session expired.", show_alert=True)
         return
-    direction = q.data.split(":")[1]
-    if direction == "next":
-        cs["ep_page"] = cs.get("ep_page", 0) + 1
-    else:
-        cs["ep_page"] = max(0, cs.get("ep_page", 0) - 1)
+    action = q.data.split(":")[1]
+
+    if action == "jump":
+        user_state[uid]["awaiting_jump"] = True
+        await q.answer()
+        await q.message.reply_text(
+            f"🔢 *Send the episode number* (1-{cs['total']}) you want to open.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await q.answer("⏳ Loading…" if action in ("next", "p10") else None)
+    page = cs.get("ep_page", 0)
+    if action == "next":
+        page += 1
+    elif action == "prev":
+        page -= 1
+    elif action == "p10":
+        page += 10
+    elif action == "m10":
+        page -= 10
+    cs["ep_page"] = max(0, page)
     await _send_episodes(uid, q=q)
 
 
@@ -613,15 +762,13 @@ async def cb_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     cs         = user_state.get(uid, {}).get("current_show", {})
     show_title = cs.get("title", "Pocket FM")
-    ep_title   = next(
-        (ep["title"] for ep in cs.get("episodes", []) if ep["id"] == episode_id),
-        "Episode",
-    )
+    ep_idx, ep_data = _find_ep(cs, episode_id)
+    ep_title   = (ep_data or {}).get("title", "Episode")
 
     prog = await q.message.reply_text(
         f"⏳ *Wait... Im Downloading* ✨\n\n"
-        f"📖 *{show_title}*\n"
-        f"🎧 *{ep_title}*\n\n"
+        f"📖 *{_md(show_title)}*\n"
+        f"🎧 *{_md(ep_title)}*\n\n"
         "_Fetching audio URL…_",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -630,46 +777,62 @@ async def cb_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         loop = asyncio.get_event_loop()
 
-        # 1. Stream URL is already embedded in the episode data fetched when
-        #    the show's episode list was loaded (pocketfm.com returns it
-        #    directly on each story — no separate "get stream" endpoint).
-        ep_data = next(
-            (ep for ep in cs.get("episodes", []) if ep["id"] == episode_id), None
-        )
-        stream_url = (ep_data or {}).get("media_url") or (ep_data or {}).get("hls_url")
-        if not stream_url:
-            reason = (
-                "🔒 This episode is locked/paid on PocketFM — no free audio URL available."
-                if (ep_data or {}).get("is_locked")
-                else "Could not get audio URL for this episode.\nIt may require a premium account."
-            )
+        if not ep_data:
             await prog.edit_text(
-                f"❌ *Download Failed*\n\n{reason}",
+                "❌ *Download Failed*\n\nSession expired - open the show again.",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
 
         await prog.edit_text(
             f"📥 *Downloading audio…*\n\n"
-            f"📖 *{show_title}*\n"
-            f"🎧 *{ep_title}*",
+            f"📖 *{_md(show_title)}*\n"
+            f"🎧 *{_md(ep_title)}*",
             parse_mode=ParseMode.MARKDOWN,
         )
 
-        # 2. Download to temp file
+        # 1. Download. Every stream URL pocketfm.com gave for the episode (video_url /
+        #    media_url HLS, DASH, direct file) is tried until one yields the real audio.
         with tempfile.NamedTemporaryFile(
             suffix=".mp3", prefix=f"pfm_{episode_id}_", delete=False
         ) as tmp:
             tmp_path = tmp.name
 
-        ok = await loop.run_in_executor(None, pfm.download_audio, stream_url, tmp_path)
-        if not ok or not os.path.exists(tmp_path):
-            await prog.edit_text(
-                "❌ *Download error.* Please try again.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return
+        shared = pfm.shared_urls(list(cs.get("eps", {}).values()))
+        ok, reason, source = await loop.run_in_executor(
+            None, pfm.download_episode_audio, ep_data, tmp_path, shared
+        )
 
+        if not ok and reason in ("none", "failed") and ep_idx is not None:
+            # the list page may have carried no URLs for this episode - read it fresh once
+            changed = await loop.run_in_executor(
+                None, pfm.refresh_episode_urls, cs["id"], ep_idx, ep_data
+            )
+            if changed:
+                shared = pfm.shared_urls(list(cs.get("eps", {}).values()))
+                ok, reason, source = await loop.run_in_executor(
+                    None, pfm.download_episode_audio, ep_data, tmp_path, shared
+                )
+
+        if not ok or not os.path.exists(tmp_path):
+            if reason == "drm":
+                msg = ("🔐 This episode only exists as a DRM-encrypted stream on "
+                       "PocketFM, which can't be downloaded.")
+            elif reason == "none":
+                msg = ("No stream URL was found for this episode."
+                       + ("\n_(It is a paid/coin episode on PocketFM.)_" if ep_data.get("coins_required") else ""))
+            else:
+                msg = "Download error. Please try again."
+            await prog.edit_text(f"❌ *Download Failed*\n\n{msg}", parse_mode=ParseMode.MARKDOWN)
+            return
+        logger.info(f"ep {episode_id} downloaded via {source}")
+
+        # 2. Telegram bots can upload max 50 MB - squeeze long episodes under it
+        if os.path.getsize(tmp_path) > TG_MAX_MB * 1024 * 1024:
+            await prog.edit_text(
+                f"🗜 *Compressing…*\n🎧 *{_md(ep_title)}*", parse_mode=ParseMode.MARKDOWN
+            )
+            await loop.run_in_executor(None, pfm.shrink_to_limit, tmp_path, TG_MAX_MB)
         size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
         if size_mb > 50:
             await prog.edit_text(
@@ -685,26 +848,29 @@ async def cb_download(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             cs.get("image_url") or "",
         )
 
-        # 4. Upload
+        # 4. Upload (long timeouts: PTB's defaults are a few seconds, far too short for
+        #    a multi-MB audio file on a slow host)
         await prog.edit_text(
-            f"📤 *Uploading to Telegram…*\n🎧 *{ep_title}*",
+            f"📤 *Uploading to Telegram…*\n🎧 *{_md(ep_title)}*",
             parse_mode=ParseMode.MARKDOWN,
         )
         me = await ctx.bot.get_me()
         pages_line = f"\n🌐 [Web Player]({GITHUB_PAGES_URL})" if GITHUB_PAGES_URL else ""
         caption = (
-            f"🎙️ *{show_title}*\n"
-            f"📌 *{ep_title}*"
+            f"🎙️ *{_md(show_title)}*\n"
+            f"📌 *{_md(ep_title)}*"
             f"{pages_line}\n\n"
-            f"_Via @{me.username}_"
+            f"_Via @{_md(me.username)}_"
         )
         with open(tmp_path, "rb") as af:
             await q.message.reply_audio(
                 audio=af,
                 title=ep_title,
                 performer=show_title,
+                duration=int(ep_data.get("duration") or 0) or None,
                 caption=caption,
                 parse_mode=ParseMode.MARKDOWN,
+                read_timeout=300, write_timeout=300, connect_timeout=30, pool_timeout=30,
             )
         await prog.delete()
 

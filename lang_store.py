@@ -33,6 +33,9 @@ LANGUAGES = {
     "marathi":   "🪔 Marathi",
     "gujarati":  "🦁 Gujarati",
     "punjabi":   "🌾 Punjabi",
+    "kannada":   "🏵 Kannada",
+    "malayalam": "🌴 Malayalam",
+    "all":       "🌍 All Languages",
 }
 
 
